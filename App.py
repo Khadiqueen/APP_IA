@@ -1493,11 +1493,59 @@ div[data-testid="stSelectbox"] label p { font-size:12px; margin-bottom:2px; }
 # -------- RECOMMANDATION --------
 elif page == "🎬 Recommandation":
     import re, pickle, numpy as np, pandas as pd, urllib.parse as _url
+    from pathlib import Path
 
     st.markdown(
         "<h2 style='font-family:Segoe UI, sans-serif; font-size:30px; font-weight:900;'>🎬 Système de recommandation de films</h2>",
         unsafe_allow_html=True
     )
+
+    # --- CHARGEMENT ROBUSTE DES FICHIERS DE MODELES/DONNEES ---
+    BASE_DIR = Path(__file__).resolve().parent
+
+    def _first_existing(*relpaths):
+        """Retourne le premier chemin existant parmi plusieurs candidats (ex: models/xxx, xxx)."""
+        for rp in relpaths:
+            p = (BASE_DIR / rp).resolve()
+            if p.exists():
+                return p
+        return None
+
+    def _load_pickle(*candidates):
+        """Charge un pickle en testant plusieurs emplacements; gère aussi l’erreur LFS (pointer non fetch)."""
+        p = _first_existing(*candidates)
+        if p is None:
+            return None
+        try:
+            with open(p, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            st.error(f"⚠️ Impossible de lire {p.name} ({e}). Si tu es sur Streamlit Cloud, vérifie Git LFS/bande passante.")
+            return None
+
+    def _load_numpy(*candidates):
+        p = _first_existing(*candidates)
+        if p is None:
+            return None
+        try:
+            return np.load(p, allow_pickle=True)
+        except Exception as e:
+            st.error(f"⚠️ Impossible de lire {p.name} ({e}).")
+            return None
+
+    # ---------- Chargement (essaie models/ puis racine) ----------
+    movies       = _load_pickle("models/movie_list.pkl", "movie_list.pkl")
+    similarity   = _load_pickle("models/similarity.pkl", "similarity.pkl")
+    svd_model    = _load_pickle("models/svd_model.pkl", "svd_model.pkl")
+    svd_items    = _load_pickle("models/svd_items.pkl", "svd_items.pkl") or []
+    als_item_f   = _load_numpy("models/als_item_factors.npy", "als_item_factors.npy")
+    als_user_f   = _load_numpy("models/als_user_factors.npy", "als_user_factors.npy")
+    als_items_map = _load_pickle("models/als_items.pkl", "als_items.pkl") or {}
+
+    # Sanity-check et messages propres
+    if movies is None or similarity is None:
+        st.warning("⚠️ Données de reco indisponibles (movie_list.pkl/similarity.pkl non trouvés). "
+                   "Assure-toi qu’ils sont présents dans /models (et bien téléchargés par Git LFS).")
 
     # ---- Styles UI (images plus nettes + cartes) ----
     st.markdown("""
@@ -1530,7 +1578,8 @@ elif page == "🎬 Recommandation":
             m = int(m or 0)
         except Exception:
             m = 0
-        if m <= 0: return "Durée indisponible"
+        if m <= 0:
+            return "Durée indisponible"
         h, mn = divmod(m, 60)
         return f"{h} h {mn:02d}"
 
@@ -1548,38 +1597,6 @@ elif page == "🎬 Recommandation":
         except Exception:
             pass
         return None
-
-    # ---- Chargement modèles/données (content + collaboratif) ----
-    @st.cache_resource
-    def _load_models_all():
-        # Content
-        try:
-            movies = pickle.load(open("movie_list.pkl", "rb"))
-            similarity = pickle.load(open("similarity.pkl", "rb"))
-        except Exception:
-            movies, similarity = None, None
-        # SVD
-        try:
-            svd_model = pickle.load(open("svd_model.pkl", "rb"))
-            svd_items = pickle.load(open("svd_items.pkl", "rb"))
-        except Exception:
-            svd_model, svd_items = None, []
-        # ALS
-        try:
-            als_item_f = np.load("als_item_factors.npy")
-            als_user_f = np.load("als_user_factors.npy")
-            als_items_map = pickle.load(open("als_items.pkl", "rb"))  # idx_item -> movie_id (TMDB)
-            # normaliser les clés/valeurs en int
-            als_items_map = {
-                _as_int(k): _as_int(v)
-                for k, v in (als_items_map or {}).items()
-                if _as_int(k) is not None and _as_int(v) is not None
-            }
-        except Exception:
-            als_item_f, als_user_f, als_items_map = None, None, {}
-        return movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map
-
-    movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map = _load_models_all()
 
     # ---- Validations robustes ----
     def _valid_content():
@@ -1614,7 +1631,8 @@ elif page == "🎬 Recommandation":
         try:
             d = tmdb_movie_cached(mid) if 'tmdb_movie_cached' in globals() else {}
             t = (d or {}).get("title")
-            if t: return str(t)
+            if t:
+                return str(t)
         except Exception:
             pass
         return f"Film #{mid}"
@@ -1623,11 +1641,15 @@ elif page == "🎬 Recommandation":
         base = {"title": resolve_title(mid)}
         details = {}
         if 'tmdb_movie_cached' in globals():
-            try: details = tmdb_movie_cached(mid) or {}
-            except Exception: details = {}
+            try:
+                details = tmdb_movie_cached(mid) or {}
+            except Exception:
+                details = {}
         if (not details) and ('tmdb_get' in globals()):
-            try: details = tmdb_get(f"movie/{mid}", params={"append_to_response": "release_dates"}) or {}
-            except Exception: details = {}
+            try:
+                details = tmdb_get(f"movie/{mid}", params={"append_to_response": "release_dates"}) or {}
+            except Exception:
+                details = {}
 
         title = details.get("title") or base.get("title")
         overview = details.get("overview") or ""
@@ -1659,15 +1681,18 @@ elif page == "🎬 Recommandation":
             return None
         # 1) exact
         m = mdf.index[mdf["title"] == title]
-        if len(m) > 0: return int(m[0])
+        if len(m) > 0:
+            return int(m[0])
         # 2) caseless
         tcf = str(title).casefold().strip()
         m2 = mdf.index[mdf["title"].astype(str).str.casefold().str.strip() == tcf]
-        if len(m2) > 0: return int(m2[0])
-        # 3) contient (début/fin)
+        if len(m2) > 0:
+            return int(m2[0])
+        # 3) contient (partout)
         esc = re.escape(title.strip())
         m3 = mdf.index[mdf["title"].astype(str).str.contains(esc, case=False, regex=True)]
-        if len(m3) > 0: return int(m3[0])
+        if len(m3) > 0:
+            return int(m3[0])
         # 4) fallback : premier film
         try:
             return int(mdf.index[0])
@@ -1689,18 +1714,18 @@ elif page == "🎬 Recommandation":
         mids_ranked = []
         base_genres = set()
         try:
-            base_genres = set(str(movies.iloc[idx].get("genres","")).lower().replace("/", ",").split(","))
+            base_genres = set(str(movies.iloc[idx].get("genres", "")).lower().replace("/", ",").split(","))
             base_genres = {g.strip() for g in base_genres if g.strip()}
         except Exception:
             pass
 
         for i, _ in scores:
             mid = _as_int(movies.iloc[i].get("movie_id"))
-            if mid is None: 
+            if mid is None:
                 continue
             if same_genre_only and base_genres:
                 try:
-                    g = set(str(movies.iloc[i].get("genres","")).lower().replace("/", ",").split(","))
+                    g = set(str(movies.iloc[i].get("genres", "")).lower().replace("/", ",").split(","))
                     g = {x.strip() for x in g if x.strip()}
                     if not (g & base_genres):
                         continue
@@ -1708,9 +1733,9 @@ elif page == "🎬 Recommandation":
                     pass
             mids_ranked.append(mid)
 
-        mids_ranked = [m for m in dict.fromkeys(mids_ranked) if m in VALID_IDS]
+        mids_ranked = [m for m in dict.fromkeys(mids_ranked) if (not VALID_IDS or m in VALID_IDS)]
         if not mids_ranked and same_genre_only:
-            # >>> Fallback : sans filtre de genre pour éviter le "aucun film"
+            # Fallback : sans filtre de genre pour éviter le "aucun film"
             return _content_ids_by_title_cached(title, k=k, same_genre_only=False)
         return mids_ranked[:k]
 
@@ -1722,7 +1747,7 @@ elif page == "🎬 Recommandation":
         scored = []
         for mid in svd_items:
             mi = _as_int(mid)
-            if mi is None: 
+            if mi is None:
                 continue
             try:
                 est = float(svd_model.predict(uid, mi).est)
@@ -1731,7 +1756,7 @@ elif page == "🎬 Recommandation":
                 continue
         scored.sort(key=lambda x: x[1], reverse=True)
         mids = [m for m, _ in scored]
-        mids = [m for m in dict.fromkeys(mids) if m in VALID_IDS]
+        mids = [m for m in dict.fromkeys(mids) if (not VALID_IDS or m in VALID_IDS)]
         return mids[:k]
 
     # ---- Collaboratif ALS (avec validations + fallback) ----
@@ -1758,7 +1783,7 @@ elif page == "🎬 Recommandation":
                 continue
             if (seed_mid is not None) and (mid == seed_mid):
                 continue
-            if (VALID_IDS and mid not in VALID_IDS):
+            if VALID_IDS and mid not in VALID_IDS:
                 continue
             seen_mids.add(mid)
             mids.append(mid)
@@ -1781,7 +1806,7 @@ elif page == "🎬 Recommandation":
     # ---- Session: likes partagés avec "Recommandation avancée" ----
     if "liked_movies" not in st.session_state:
         st.session_state["liked_movies"] = []
-    liked_mids: list[int] = [ _as_int(x) for x in st.session_state["liked_movies"] if _as_int(x) is not None ]
+    liked_mids: list[int] = [_as_int(x) for x in st.session_state["liked_movies"] if _as_int(x) is not None]
     liked_mids = [m for m in dict.fromkeys(liked_mids) if (m is not None and (not VALID_IDS or m in VALID_IDS))]
 
     # ===================== UI PRINCIPALE =====================
@@ -1799,169 +1824,7 @@ elif page == "🎬 Recommandation":
             options += ["Collaboratif (SVD)"]
         if _valid_als():
             options += ["Collaboratif (ALS)"]
-        mode = st.selectbox("Mode de recommandation", options, index=0, key="reco_mode_sel")
-
-    # Afficher vos likes (info, pas de boutons ici)
-    if liked_mids:
-        st.markdown("### 🧡 Vos likes (synchro depuis *Recommandation avancée*)")
-        st.markdown('<div class="grid">', unsafe_allow_html=True)
-        for mid in liked_mids[:12]:
-            poster = _safe_fetch_poster(mid, size="w500")
-            st.markdown('<div class="it">', unsafe_allow_html=True)
-            if poster:
-                st.image(poster, width=180, use_container_width=False)
-            st.markdown(f'<div class="cap">{resolve_title(mid)}</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # Bouton principal
-    if st.button("🔁 Recommander", key="btn_reco_run"):
-        # index + mid sélectionné (robuste)
-        idx_sel = _find_title_index(movies, selected_movie)
-        selected_mid = None
-        try:
-            if idx_sel is not None:
-                selected_mid = _as_int(movies.iloc[idx_sel]["movie_id"])
-        except Exception:
-            selected_mid = None
-
-        # Recos principales (6) avec fallback durs
-        mids_main = []
-        if mode == "Content-based (cosine)":
-            mids_main = _content_ids_by_title_cached(selected_movie, k=6, same_genre_only=True)
-            if not mids_main:
-                mids_main = _content_ids_by_title_cached(selected_movie, k=6, same_genre_only=False)
-        elif mode == "Collaboratif (SVD)":
-            mids_main = recommend_svd_for_user(k=6)
-            if not mids_main:
-                # fallback sur content
-                mids_main = _content_ids_by_title_cached(selected_movie, k=6, same_genre_only=False)
-        else:  # ALS
-            seed = (liked_mids[-1] if liked_mids else selected_mid)
-            mids_main = recommend_als_for_seed(seed, k=6)
-            if not mids_main:
-                # fallback → SVD → content
-                mids_main = recommend_svd_for_user(k=6) or _content_ids_by_title_cached(resolve_title(seed) if seed else selected_movie, k=6, same_genre_only=False)
-
-        # Nettoyage final
-        mids_main = [ _as_int(m) for m in (mids_main or []) if _as_int(m) is not None ]
-        if selected_mid is not None:
-            mids_main = [m for m in mids_main if m != selected_mid]
-        if VALID_IDS:
-            mids_main = [m for m in mids_main if m in VALID_IDS]
-        # uniques et tranche
-        mids_main = list(dict.fromkeys(mids_main))[:6]
-
-        if not mids_main:
-            st.warning("Aucune recommandation exploitable avec les modèles actuels.")
-        else:
-            for mid in mids_main:
-                meta = resolve_details(mid)
-                title_txt   = meta["title"]
-                overview    = meta["overview"]
-                vote        = meta["vote"]
-                genres_text = meta["genres_text"]
-                runtime_min = meta["runtime_min"]
-                runtime_hr  = minutes_to_hhmm(runtime_min)
-                year        = meta["year"]
-                countries   = meta["countries"]
-
-                # Certification d'âge (si dispo)
-                age_cert = "Accès tout public"
-                try:
-                    rels = (meta["raw"] or {}).get("release_dates", {}).get("results", [])
-                    def pick_cert(cc):
-                        for r in rels:
-                            if r.get("iso_3166_1") == cc:
-                                for c in r.get("release_dates", []):
-                                    cert = (c.get("certification") or "").strip()
-                                    if cert: return cert
-                        return None
-                    age_cert = pick_cert("FR") or pick_cert("US") or "Accès tout public"
-                except Exception:
-                    pass
-
-                poster = _safe_fetch_poster(mid, size="w500")
-                watch_url = build_watch_link_fr(title_txt, year)
-
-                c1, c2 = st.columns([1.05, 2])
-                with c1:
-                    if poster:
-                        st.image(poster, caption=f"**{title_txt}**", width=220, use_container_width=False)
-                    else:
-                        st.write(f"**{title_txt}**")
-                with c2:
-                    st.markdown(f"<div class='title-big'>{title_txt}</div>", unsafe_allow_html=True)
-                    st.markdown(f"<span class='badge-genre'>{genres_text}</span>", unsafe_allow_html=True)
-                    st.markdown(f"<div class='note-xxl'><span style='font-size:14px;font-weight:800;opacity:.9;margin-right:8px;'>NOTE</span> {vote:.1f}</div>", unsafe_allow_html=True)
-                    meta_bits = []
-                    if runtime_min:  meta_bits.append(f"🕒 <b>{runtime_hr}</b>")
-                    if year:         meta_bits.append(f"📅 <b>{year}</b>")
-                    if countries:    meta_bits.append(f"🌍 <b>{countries}</b>")
-                    if meta_bits:
-                        st.markdown(f"<div class='meta-line'>{' • '.join(meta_bits)}</div>", unsafe_allow_html=True)
-                    st.markdown("**Synopsis**")
-                    st.write(overview or "Synopsis indisponible.")
-                    st.markdown(f"[▶️ Voir le film / Plus d'infos]({watch_url})")
-
-        # ====== BLOCS SUPPLÉMENTAIRES PILOTÉS PAR LES LIKES (sans boutons) ======
-        if liked_mids:
-            st.markdown("---")
-            # 1) Films similaires (à partir du dernier like)
-            seed_like = liked_mids[-1]
-            seed_title = resolve_title(seed_like)
-            if seed_title:
-                st.markdown(f"### 🎞️ Films similaires à **{seed_title}**")
-                sim_ids = _content_ids_by_title_cached(seed_title, k=8, same_genre_only=True) or \
-                          _content_ids_by_title_cached(seed_title, k=8, same_genre_only=False)
-                if sim_ids:
-                    st.markdown('<div class="grid">', unsafe_allow_html=True)
-                    for mid in sim_ids:
-                        poster = _safe_fetch_poster(mid, size="w500")
-                        st.markdown('<div class="it">', unsafe_allow_html=True)
-                        if poster:
-                            st.image(poster, width=180, use_container_width=False)
-                        st.markdown(f'<div class="cap">{resolve_title(mid)}</div>', unsafe_allow_html=True)
-                        st.markdown('</div>', unsafe_allow_html=True)
-                    st.markdown('</div>', unsafe_allow_html=True)
-                else:
-                    st.info("Pas assez de similarités pour ce titre.")
-
-            # 2) Catégorie de films pour vous (genres agrégés des likes)
-            try:
-                like_genres = set()
-                for lm in liked_mids:
-                    row = movies.loc[movies["movie_id"] == lm]
-                    if not row.empty:
-                        gtxt = str(row.iloc[0].get("genres","")).lower().replace("/", ",")
-                        like_genres |= {p.strip() for p in gtxt.split(",") if p.strip()}
-                if like_genres:
-                    st.markdown("### 📂 Catégorie de films pour vous")
-                    mask = movies["genres"].astype(str).str.lower().apply(
-                        lambda g: any(gen in g for gen in like_genres)
-                    )
-                    subset = movies.loc[mask].copy()
-                    subset = subset[~subset["movie_id"].astype(int).isin(liked_mids)]
-                    subset = subset.sample(min(12, len(subset))) if len(subset) else subset
-
-                    if not subset.empty:
-                        st.markdown('<div class="grid">', unsafe_allow_html=True)
-                        for _, row in subset.iterrows():
-                            mid = _as_int(row["movie_id"])
-                            if mid is None: continue
-                            poster = _safe_fetch_poster(mid, size="w500")
-                            st.markdown('<div class="it">', unsafe_allow_html=True)
-                            if poster:
-                                st.image(poster, width=180, use_container_width=False)
-                            st.markdown(f'<div class="cap">{resolve_title(mid)}</div>', unsafe_allow_html=True)
-                            st.markdown('</div>', unsafe_allow_html=True)
-                        st.markdown('</div>', unsafe_allow_html=True)
-                    else:
-                        st.info("Pas de titres trouvés sur vos catégories préférées.")
-            except Exception:
-                pass
-
-    st.stop()
+        mode = st.selectbox("M
 
 
 
@@ -2287,21 +2150,65 @@ elif page == "📈 Prédiction Machine Learning":
                 st.markdown("</div>", unsafe_allow_html=True)
 
 
-
 #---------PARTIE 5--------
-# -------- PARTIE RECOMMANDTAION AVANCEE --------
+# -------- PARTIE RECOMMANDATION AVANCÉE --------
 elif page == "🧠 Recommandation avancée":
     import html, os, json, time, numpy as np
+    from pathlib import Path
+    import pickle
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.preprocessing import normalize as _norm
+
+    # ============================
+    #   CHARGEMENT ROBUSTE MODÈLES/DONNÉES
+    # ============================
+    BASE_DIR = Path(__file__).resolve().parent
+
+    def _first_existing(*relpaths):
+        """Retourne le premier chemin existant parmi plusieurs candidats (ex: models/xxx, xxx)."""
+        for rp in relpaths:
+            p = (BASE_DIR / rp).resolve()
+            if p.exists():
+                return p
+        return None
+
+    def _load_pickle(*candidates):
+        """Charge un pickle en testant plusieurs emplacements; gère l’erreur LFS (pointer non fetch)."""
+        p = _first_existing(*candidates)
+        if p is None:
+            return None
+        try:
+            with open(p, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            st.error(f"⚠️ Impossible de lire {p.name} ({e}). Si tu es sur Streamlit Cloud, vérifie Git LFS/bande passante.")
+            return None
+
+    def _load_numpy(*candidates):
+        p = _first_existing(*candidates)
+        if p is None:
+            return None
+        try:
+            return np.load(p, allow_pickle=True)
+        except Exception as e:
+            st.error(f"⚠️ Impossible de lire {p.name} ({e}).")
+            return None
+
+    # Chargements (essaie models/ puis racine)
+    movies        = globals().get("movies")      or _load_pickle("models/movie_list.pkl", "movie_list.pkl")
+    similarity    = globals().get("similarity")  or _load_pickle("models/similarity.pkl", "similarity.pkl")
+    svd_model     = globals().get("svd_model")   or _load_pickle("models/svd_model.pkl", "svd_model.pkl")
+    svd_items     = globals().get("svd_items")   or _load_pickle("models/svd_items.pkl", "svd_items.pkl") or []
+    als_item_f    = globals().get("als_item_f")  or _load_numpy("models/als_item_factors.npy", "als_item_factors.npy")
+    als_user_f    = globals().get("als_user_f")  or _load_numpy("models/als_user_factors.npy", "als_user_factors.npy")
+    als_items_map = globals().get("als_items_map") or _load_pickle("models/als_items.pkl", "als_items.pkl") or {}
 
     # ============================
     #       ENTÊTE & STYLES
     # ============================
     st.markdown("## 🧠 Recommandation avancée — Système de recommandation intelligente")
-    st.caption("Affinez vos goûts, likez/masquez, et découvrez ce qui cartonne par continent ")
+    st.caption("Affinez vos goûts, likez/masquez, et découvrez ce qui cartonne par continent")
 
-    # Afficher les tendances même sans dataset local
     HAS_MOVIES = not (movies is None or getattr(movies, "empty", True))
     if not HAS_MOVIES:
         st.info("📦 Données locales indisponibles pour les SUGGESTIONS. Les TENDANCES restent affichées ci-dessous.")
@@ -2319,8 +2226,6 @@ elif page == "🧠 Recommandation avancée":
         border:1px solid rgba(34,197,94,.4); background:rgba(34,197,94,.12);
         color:#34d399; font-weight:900;
       }
-
-      /* Bulle dorée (raison) */
       .why-pill{
         display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap;
         background:rgba(255,215,0,0.10); color:#FFD700; font-weight:900;
@@ -2332,8 +2237,6 @@ elif page == "🧠 Recommandation avancée":
         background:rgba(255,215,0,0.12); color:#FFD700;
         border:1px solid rgba(255,215,0,0.35); font-weight:800; font-size:13px;
       }
-
-      /* Poster + HOVER */
       .adv-poster{
         position:relative; width:var(--adv-w); aspect-ratio:2/3;
         border-radius:14px; overflow:hidden; margin:0 auto; background:#000;
@@ -2348,15 +2251,11 @@ elif page == "🧠 Recommandation avancée":
       }
       .adv-card:hover .adv-poster{ transform:translateY(-3px); box-shadow:0 14px 32px rgba(0,0,0,0.35); border-color:rgba(255,215,0,0.45); }
       .adv-poster::after{ content:""; position:absolute; inset:0; background:linear-gradient(to top, rgba(0,0,0,.40), rgba(0,0,0,0) 55%); }
-
-      /* Badge like */
       .mark-like{
         position:absolute; top:8px; left:8px; z-index:2; font-size:12px; font-weight:900;
         background:rgba(34,197,94,.16); color:#34d399; border:1px solid rgba(34,197,94,.45);
         padding:3px 8px; border-radius:10px;
       }
-
-      /* Titre + méta + chips */
       .adv-title{
         margin:12px 0 4px 0; font-weight:900; font-size:21px; line-height:1.15;
         letter-spacing:-.2px; color:#fff;
@@ -2381,7 +2280,6 @@ elif page == "🧠 Recommandation avancée":
       }
       .adv-actors{ font-size:13.5px; opacity:.96; margin-top:6px; }
       .adv-desc{ color:rgba(255,255,255,0.94); font-size:15px; margin-top:8px; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
-
       .cont-title{
         margin:20px 0 8px 0; text-transform:uppercase; font-weight:900; letter-spacing:.6px;
         border-left:3px solid #FFD700; padding-left:10px;
@@ -2389,29 +2287,6 @@ elif page == "🧠 Recommandation avancée":
       .adv-card [data-testid="column"] button, .adv-card .stButton > button{ width:100%; border-radius:999px; font-weight:800; }
     </style>
     """, unsafe_allow_html=True)
-
-    # ============================
-    #       CACHE DISQUE
-    # ============================
-    def _disk_get(key, ttl=900, path=".cache_reco.json"):
-        try:
-            if not os.path.exists(path):
-                return None
-            data = json.load(open(path, "r", encoding="utf-8"))
-            it = data.get(key)
-            if not it or (time.time() - it["ts"] > ttl):
-                return None
-            return it["val"]
-        except Exception:
-            return None
-
-    def _disk_set(key, val, path=".cache_reco.json"):
-        try:
-            data = json.load(open(path, "r", encoding="utf-8")) if os.path.exists(path) else {}
-            data[key] = {"ts": time.time(), "val": val}
-            json.dump(data, open(path, "w", encoding="utf-8"))
-        except Exception:
-            pass
 
     # ============================
     #         UTILITAIRES
@@ -2443,7 +2318,7 @@ elif page == "🧠 Recommandation avancée":
 
     def _genres_to_set(gstr: str) -> set:
         parts = [p.strip() for p in (gstr or "").replace("/", ",").split(",") if p.strip()]
-        return { _norm_genre_name(p) for p in parts }
+        return {_norm_genre_name(p) for p in parts}
 
     def split_genres(g):
         return [s for s in (g or "").replace("/", ",").split(",") if s.strip()]
@@ -2468,8 +2343,10 @@ elif page == "🧠 Recommandation avancée":
     def brief_from_meta(title, genres, year, runtime_min):
         g = ", ".join([g for g in split_genres(genres)][:2]) or "Genre non précisé"
         bits = []
-        if year: bits.append(str(year))
-        if runtime_min: bits.append(minutes_to_hhmm(runtime_min))
+        if year:
+            bits.append(str(year))
+        if runtime_min:
+            bits.append(minutes_to_hhmm(runtime_min))
         meta = " • ".join(bits)
         base = f"{title or 'Film'} — {g}"
         return f"{base}{(' • ' + meta) if meta else ''}."
@@ -2478,19 +2355,40 @@ elif page == "🧠 Recommandation avancée":
         """
         Toujours retourner une phrase courte et lisible.
         - Si overview existe: on tronque proprement.
-        - Si trop court ou vide: on génère un bref résumé à partir du titre + meta.
+        - Sinon (ou trop court): bref résumé basé sur titre + genres + (année/durée si dispo).
         """
         s = synopsis_trim(overview or "", max_chars=max_chars)
         if s and len(s) >= min_len:
             return s
         year = (data.get("release_date") or "")[:4]
-        # résumé express basé sur le titre + meta (jamais vide)
         return brief_from_meta(title or data.get("name") or "Titre", genres, year, data.get("runtime") or 0)
 
     def synopsis_or_brief(ov, genres, data):
-        # Conservée pour compatibilité, mais smart_synopsis est utilisée partout
         title = data.get("title") or data.get("name") or "Titre"
         return smart_synopsis(title, ov, genres, data, max_chars=220, min_len=60)
+
+    # ============================
+    #         CACHE DISQUE
+    # ============================
+    def _disk_get(key, ttl=900, path=".cache_reco.json"):
+        try:
+            if not os.path.exists(path):
+                return None
+            data = json.load(open(path, "r", encoding="utf-8"))
+            it = data.get(key)
+            if not it or (time.time() - it["ts"] > ttl):
+                return None
+            return it["val"]
+        except Exception:
+            return None
+
+    def _disk_set(key, val, path=".cache_reco.json"):
+        try:
+            data = json.load(open(path, "r", encoding="utf-8")) if os.path.exists(path) else {}
+            data[key] = {"ts": time.time(), "val": val}
+            json.dump(data, open(path, "w", encoding="utf-8"))
+        except Exception:
+            pass
 
     @st.cache_data(show_spinner=False, ttl=86400)
     def get_age_certification(mid):
@@ -2502,7 +2400,8 @@ elif page == "🧠 Recommandation avancée":
                     if r.get("iso_3166_1") == cc:
                         for c in r.get("release_dates", []):
                             cert = (c.get("certification") or "").strip()
-                            if cert: return cert
+                            if cert:
+                                return cert
             return pick("FR") or pick("US") or "Tous publics"
         except Exception:
             return "Tous publics"
@@ -2585,8 +2484,8 @@ elif page == "🧠 Recommandation avancée":
         D = Xn.shape[1]
 
         # ---------- Genres + feedback ----------
-        ALL_GENRES = ["Action","Drame","Comédie","Romance","Science-Fiction","Thriller","Horreur","Animation"]
-        DEFAULT_GENRES = ["Action","Drame"]
+        ALL_GENRES = ["Action", "Drame", "Comédie", "Romance", "Science-Fiction", "Thriller", "Horreur", "Animation"]
+        DEFAULT_GENRES = ["Action", "Drame"]
         st.session_state.setdefault("_adv_fav_genres", DEFAULT_GENRES.copy())
         if st.session_state.get("_adv_clear_genres", False):
             st.session_state._adv_clear_genres = False
@@ -2625,7 +2524,7 @@ elif page == "🧠 Recommandation avancée":
 
         profile_key = tuple(sorted(fav_set_norm))
 
-        # --------- filtre OR ----------
+        # --------- filtre OR sur genres ----------
         def _genres_match(mid):
             gset = genres_by_mid.get(mid, set())
             if not fav_set_norm:
@@ -2724,21 +2623,23 @@ elif page == "🧠 Recommandation avancée":
             ov, genres_raw, data = fetch_overview_vote_genres_fast(mid)
             gset = genres_by_mid.get(mid, _genres_to_set(genres_raw))
             genres_text = ", ".join(sorted({g.title() for g in gset})) or (genres_raw or "Genres indisponibles")
+            title = (data.get("title") or data.get("name") or (titles_dl[i] if i < len(titles_dl) else None) or "Titre indisponible")
 
-            title  = (data.get("title") or data.get("name") or (titles_dl[i] if i < len(titles_dl) else None) or "Titre indisponible")
-
-            # >>> IMAGES PLUS NETTES via srcset (w500 + w780) tout en affichant à 240px
+            # Images nettes via srcset
             poster_500 = fetch_poster_fast(mid, size="w500")
             poster_780 = fetch_poster_fast(mid, size="w780") or poster_500
-            img_tag = f"<img src='{poster_500}' srcset='{poster_500} 500w, {poster_780} 780w' sizes='(max-width: 260px) 240px, 240px' alt='{html.escape(title)}' loading='lazy'>"
+            img_tag = (
+                f"<img src='{poster_500}' srcset='{poster_500} 500w, {poster_780} 780w' "
+                f"sizes='(max-width: 260px) 240px, 240px' alt='{html.escape(title)}' loading='lazy'>"
+            )
 
-            note   = float(data.get("vote_average") or 0)
-            year   = (data.get("release_date") or "")[:4]
+            note = float(data.get("vote_average") or 0)
+            year = (data.get("release_date") or "")[:4]
             runtime_hh = minutes_to_hhmm(data.get("runtime") or 0)
-            age    = get_age_certification(mid)
-            cast   = fetch_top_cast_names(mid, limit=3)
+            age = get_age_certification(mid)
+            cast = fetch_top_cast_names(mid, limit=3)
 
-            # >>> SYNOPSIS TOUJOURS PROPRE
+            # >>> SYNOPSIS TOUJOURS COURT (fallback si trop court/absent)
             desc = smart_synopsis(title, ov, genres_text, data, max_chars=220, min_len=60)
 
             card_id = f"card_{mid}"
@@ -2752,7 +2653,10 @@ elif page == "🧠 Recommandation avancée":
                 st.markdown(f"<div class='adv-poster'>{img_tag}</div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='adv-title'><b>{html.escape(title)}</b></div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='adv-chip'>{html.escape(genres_text)}</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='adv-meta'>⭐ {note:.1f}/10 • 🕒 {runtime_hh} • 👤 {age} • 📅 {year or '—'}</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='adv-meta'>⭐ {note:.1f}/10 • 🕒 {runtime_hh} • 👤 {age} • 📅 {year or '—'}</div>",
+                    unsafe_allow_html=True
+                )
 
                 if cast:
                     st.markdown(f"<div class='adv-actors'><b>Avec :</b> {html.escape(', '.join(cast))}</div>", unsafe_allow_html=True)
@@ -2761,21 +2665,20 @@ elif page == "🧠 Recommandation avancée":
                 c1, c2 = st.columns(2)
                 with c1:
                     if st.button("👍 J’aime", key=f"_adv_like_{mid}"):
-                        # toggle + synchro globale
                         if mid in st.session_state._adv_likes_mid:
                             st.session_state._adv_likes_mid.discard(mid)
-                            unlike_movie(mid)            # >>> LIKES SYNC
+                            unlike_movie(mid)  # sync
                             st.session_state._adv_flash = f"Retiré des préférences : {title}"
                         else:
                             st.session_state._adv_likes_mid.add(mid)
-                            like_movie(mid)              # >>> LIKES SYNC
+                            like_movie(mid)    # sync
                             st.session_state._adv_flash = f"Ajouté aux préférences : {title}"
                         st.rerun()
                 with c2:
                     if st.button("👎 Je n’aime pas", key=f"_adv_dislike_{mid}"):
                         st.session_state._adv_dislikes_ids.add(mid)
                         st.session_state._adv_ui_disliked.add(mid)
-                        unlike_movie(mid)                # >>> LIKES SYNC (si était liké, on le retire)
+                        unlike_movie(mid)  # si était liké
                         try:
                             st.session_state._adv_visible_idx.pop(slot)
                         except Exception:
@@ -2816,8 +2719,10 @@ elif page == "🧠 Recommandation avancée":
             return cached
         try:
             d = tmdb_get("discover/movie", params={
-                "with_origin_country":"|".join(codes),
-                "sort_by":"popularity.desc","language":"fr-FR","page":1
+                "with_origin_country": "|".join(codes),
+                "sort_by": "popularity.desc",
+                "language": "fr-FR",
+                "page": 1
             }) or {}
             res = d.get("results", [])[:limit]
             _disk_set(key, res)
@@ -2833,8 +2738,11 @@ elif page == "🧠 Recommandation avancée":
             return cached
         try:
             d = tmdb_get("discover/movie", params={
-                "with_origin_country":"|".join(codes),"with_genres":genre_id,
-                "sort_by":"popularity.desc","language":"fr-FR","page":1
+                "with_origin_country": "|".join(codes),
+                "with_genres": genre_id,
+                "sort_by": "popularity.desc",
+                "language": "fr-FR",
+                "page": 1
             }) or {}
             res = d.get("results", [])[:limit]
             _disk_set(key, res)
@@ -2842,28 +2750,28 @@ elif page == "🧠 Recommandation avancée":
         except Exception:
             return []
 
-    ASIA_EXTRA_TITLES = ["K-pop Demon Hunter","K-POP Demon Hunter","K-pop: Demon Hunter"]
-    AFRICAN_TITLES    = ["Kirikou et la sorcière","Sarafina!","Jagun Jagun","Les Initiés",
-                         "À la recherche du mari de ma femme","Le blanc d'Eyenga"]
+    ASIA_EXTRA_TITLES = ["K-pop Demon Hunter", "K-POP Demon Hunter", "K-pop: Demon Hunter"]
+    AFRICAN_TITLES    = ["Kirikou et la sorcière", "Sarafina!", "Jagun Jagun", "Les Initiés",
+                         "À la recherche du mari de ma femme", "Le blanc d'Eyenga"]
 
     @st.cache_data(show_spinner=False, ttl=900)
     def search_titles_fr(titles):
         key = "search_" + "_".join(titles)
         cached = _disk_get(key, ttl=900)
-        if cached is not None: 
+        if cached is not None:
             return cached
         found = []
         for q in titles:
             d = tmdb_get("search/movie", params={"query": q, "language": "fr-FR"}) or {}
             r = (d.get("results") or [])
-            if not r: 
+            if not r:
                 continue
-            m = r[0]; mid = m.get("id")
-            if not mid: 
+            m = r[0]
+            mid = m.get("id")
+            if not mid:
                 continue
             ov, g, data = fetch_overview_vote_genres_fast(mid)
-            # >>> images nettes pour tendances aussi
-            poster_500 = fetch_poster_fast(mid, size="w500")
+            poster_500 = fetch_poster_fast(mid, size="w500")  # images nettes
             year = (data.get("release_date") or "")[:4]
             title = data.get("title") or m.get("title") or q
             found.append({"id": mid, "title": title, "poster": poster_500, "genres": g, "overview": ov, "year": year})
@@ -2879,59 +2787,69 @@ elif page == "🧠 Recommandation avancée":
         items, page = [], 1
         while len(items) < limit and page <= 5:
             d = tmdb_get("movie/popular", params={"page": page, "language": "fr-FR"}) or {}
-            items.extend(d.get("results", [])); page += 1
-        items = items[:limit]; _disk_set(key, items); return items
+            items.extend(d.get("results", []))
+            page += 1
+        items = items[:limit]
+        _disk_set(key, items)
+        return items
 
     @st.cache_data(show_spinner=False, ttl=900)
     def build_trending_grouped(n_per=60, pool=200):
         hot = tmdb_popular_fr(limit=pool) or []
-        out = {"Afrique":[], "Asie":[], "Europe":[], "Amérique":[]}
+        out = {"Afrique": [], "Asie": [], "Europe": [], "Amérique": []}
         seen_ids = set()
 
         def _push(mid, payload, continent):
-            if mid in seen_ids or len(out[continent]) >= n_per: return
-            seen_ids.add(mid); out[continent].append(payload)
+            if mid in seen_ids or len(out[continent]) >= n_per:
+                return
+            seen_ids.add(mid)
+            out[continent].append(payload)
 
         for m in hot:
             mid = m.get("id")
-            if not mid: continue
+            if not mid:
+                continue
             d = tmdb_movie_cached(mid) or {}
             pc = [c.get("iso_3166_1") for c in (d.get("production_countries") or []) if c.get("iso_3166_1")]
             cont = _continent_from_codes(pc)
             if not cont:
                 lang = (d.get("original_language") or "").upper()
-                if   lang in {"ZH","JA","KO","HI"}: cont="Asie"
-                elif lang in {"FR","DE","ES","IT","RU","PT"}: cont="Europe"
-                elif lang in {"EN","ES","PT"}: cont="Amérique"
-                else: cont=None
-            if not cont: continue
+                if   lang in {"ZH", "JA", "KO", "HI"}: cont = "Asie"
+                elif lang in {"FR", "DE", "ES", "IT", "RU", "PT"}: cont = "Europe"
+                elif lang in {"EN", "ES", "PT"}: cont = "Amérique"
+                else: cont = None
+            if not cont:
+                continue
             ov, g, data = fetch_overview_vote_genres_fast(mid)
             poster_500 = fetch_poster_fast(mid, size="w500")
             year = (data.get("release_date") or "")[:4]
             title = data.get("title") or data.get("name") or m.get("title") or "Titre indisponible"
-            _push(mid, {"id":mid,"title":title,"poster":poster_500,"genres":g,"overview":ov,"year":year}, cont)
+            _push(mid, {"id": mid, "title": title, "poster": poster_500, "genres": g, "overview": ov, "year": year}, cont)
 
         if len(out["Afrique"]) < n_per:
-            extra = discover_by_countries(["NG","ZA","EG","MA","KE","GH","SN","CI","CM"], limit=(n_per-len(out["Afrique"])) * 2)
+            extra = discover_by_countries(["NG","ZA","EG","MA","KE","GH","SN","CI","CM"], limit=(n_per - len(out["Afrique"])) * 2)
             for m in extra:
                 mid = m.get("id")
-                if not mid: continue
+                if not mid:
+                    continue
                 ov, g, data = fetch_overview_vote_genres_fast(mid)
                 poster_500 = fetch_poster_fast(mid, size="w500")
                 year = (m.get("release_date") or data.get("release_date") or "")[:4]
                 title = m.get("title") or data.get("title") or "Titre indisponible"
-                _push(mid, {"id":mid,"title":title,"poster":poster_500,"genres":g,"overview":ov,"year":year}, "Afrique")
-                if len(out["Afrique"]) >= n_per: break
+                _push(mid, {"id": mid, "title": title, "poster": poster_500, "genres": g, "overview": ov, "year": year}, "Afrique")
+                if len(out["Afrique"]) >= n_per:
+                    break
 
         if len(out["Afrique"]) < n_per:
             for it in search_titles_fr(AFRICAN_TITLES):
                 _push(it["id"], it, "Afrique")
-                if len(out["Afrique"]) >= n_per: break
+                if len(out["Afrique"]) >= n_per:
+                    break
 
         for it in search_titles_fr(ASIA_EXTRA_TITLES):
             _push(it["id"], it, "Asie")
 
-        GENRES_ENSURE = [("Action",28), ("Horreur",27), ("Animation",16)]
+        GENRES_ENSURE = [("Action", 28), ("Horreur", 27), ("Animation", 16)]
         CONTINENT_CODES = {
             "Afrique": ["NG","ZA","EG","MA","KE","GH","SN","CI","CM"],
             "Asie":    ["KR","JP","CN","IN","TH","VN","ID","PH","MY","TW","HK"],
@@ -2939,22 +2857,25 @@ elif page == "🧠 Recommandation avancée":
             "Amérique":["US","CA","BR","MX","AR","CL","CO","PE"]
         }
         for cont, codes in CONTINENT_CODES.items():
-            have = " ".join(x.get("genres","") for x in out[cont]).lower()
+            have = " ".join(x.get("genres", "") for x in out[cont]).lower()
             for lbl, gid in GENRES_ENSURE:
-                if lbl.lower() in have: continue
+                if lbl.lower() in have:
+                    continue
                 for m in discover_by_countries_genre(codes, gid, limit=3):
                     mid = m.get("id")
-                    if not mid: continue
+                    if not mid:
+                        continue
                     ov, g, data = fetch_overview_vote_genres_fast(mid)
                     poster_500 = fetch_poster_fast(mid, size="w500")
                     year = (m.get("release_date") or data.get("release_date") or "")[:4]
                     title = m.get("title") or data.get("title") or "Titre indisponible"
-                    _push(mid, {"id":mid,"title":title,"poster":poster_500,"genres":g,"overview":ov,"year":year}, cont)
-                    if len(out[cont]) >= n_per: break
+                    _push(mid, {"id": mid, "title": title, "poster": poster_500, "genres": g, "overview": ov, "year": year}, cont)
+                    if len(out[cont]) >= n_per:
+                        break
         return out
 
     if show_trends:
-        # --- bootstrap session_state ---
+        # bootstrap session_state
         st.session_state.setdefault("_adv_trends_grouped", {})
         st.session_state.setdefault("_adv_trends_visible", {})
         st.session_state.setdefault("_adv_trends_cursor", {})
@@ -2972,7 +2893,7 @@ elif page == "🧠 Recommandation avancée":
             st.session_state._adv_trends_visible = {c: [] for c in st.session_state._adv_trends_grouped.keys()}
             st.session_state._adv_trends_cursor  = {c: 0  for c in st.session_state._adv_trends_grouped.keys()}
 
-        # fallback mini
+        # fallback mini si vide
         if not any(st.session_state._adv_trends_grouped.get(k) for k in ("Afrique","Asie","Europe","Amérique")):
             MIN_CODES = {
                 "Afrique": ["NG","ZA","MA","EG","CM"],
@@ -3067,15 +2988,22 @@ elif page == "🧠 Recommandation avancée":
                 if it["id"] in st.session_state._adv_dislikes_ids or it["id"] in st.session_state._adv_ui_disliked:
                     continue
 
-                # >>> synopsis garanti & propre
-                syn = smart_synopsis(it.get("title"), it.get("overview"), it.get("genres"),
-                                     {"release_date": f"{it.get('year','')}-01-01", "runtime": 0},
-                                     max_chars=220, min_len=60)
+                # >>> Synopsis garanti & propre
+                syn = smart_synopsis(
+                    it.get("title"),
+                    it.get("overview"),
+                    it.get("genres"),
+                    {"release_date": f"{it.get('year','')}-01-01", "runtime": 0},
+                    max_chars=220, min_len=60
+                )
 
-                # >>> images nettes via srcset
+                # images nettes via srcset
                 poster_500 = it.get("poster")
-                poster_780 = poster_500  # si tu veux, tu peux générer w780 ici aussi
-                img_tag = f"<img src='{poster_500}' srcset='{poster_500} 500w, {poster_780} 780w' sizes='(max-width: 260px) 240px, 240px' alt='{html.escape(it['title'])}' loading='lazy'>"
+                poster_780 = poster_500
+                img_tag = (
+                    f"<img src='{poster_500}' srcset='{poster_500} 500w, {poster_780} 780w' "
+                    f"sizes='(max-width: 260px) 240px, 240px' alt='{html.escape(it['title'])}' loading='lazy'>"
+                )
 
                 with cols[grid_pos % 3]:
                     st.markdown("<div class='adv-card'>", unsafe_allow_html=True)
@@ -3087,10 +3015,8 @@ elif page == "🧠 Recommandation avancée":
                     st.markdown(f"<div class='adv-desc'><em>{html.escape(syn)}</em></div>", unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
-    # sécurité : stopper la page ici (évite que d'autres sections se superposent)
+    # sécurité : stopper la page ici
     st.stop()
-
-
 
 
 #------- PARTIE 6--------------
