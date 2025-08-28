@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # charge .env dans os.environ
 
+
 # --- Feedback (likes/dislikes) partagé entre l'app et le notebook ---
 from pathlib import Path
 import json, time, os
@@ -514,6 +515,93 @@ def load_chat_history():
                 st.session_state.chat_history = json.load(f)
         except Exception:
             st.session_state.chat_history = []
+
+from pathlib import Path
+import pickle, numpy as np, pandas as pd
+import streamlit as st
+import ast
+
+@st.cache_resource
+def _load_all():
+    base = Path(__file__).resolve().parent
+    errors = []
+
+    def _pick(*cands):
+        for rp in cands:
+            p = (base / rp).resolve()
+            if p.exists():
+                return p
+        return None
+
+    def _load_pickle(*cands):
+        p = _pick(*cands)
+        if not p:
+            errors.append(f"{cands[0]}: No such file or directory")
+            return None
+        try:
+            with open(p, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            errors.append(f"{p.name}: {e!s}")
+            return None
+
+    def _load_numpy(*cands):
+        p = _pick(*cands)
+        if not p:
+            errors.append(f"{cands[0]}: No such file or directory")
+            return None
+        try:
+            return np.load(p, allow_pickle=True)
+        except Exception as e:
+            errors.append(f"{p.name}: {e!s}")
+            return None
+
+    # 1) Tentative : modèles pré-calculés
+    movies        = _load_pickle("models/movie_list.pkl", "movie_list.pkl")
+    similarity    = _load_pickle("models/similarity.pkl", "similarity.pkl")
+    svd_model     = _load_pickle("models/svd_model.pkl", "svd_model.pkl")
+    svd_items     = _load_pickle("models/svd_items.pkl", "svd_items.pkl") or []
+    als_item_f    = _load_numpy("models/als_item_factors.npy", "als_item_factors.npy")
+    als_user_f    = _load_numpy("models/als_user_factors.npy", "als_user_factors.npy")
+    als_items_map = _load_pickle("models/als_items.pkl", "als_items.pkl") or {}
+
+    # 2) Fallback : reconstruire un minimum depuis tes CSV (pour ne PAS afficher une page vide)
+    if movies is None or getattr(movies, "empty", True):
+        csv_path = _pick("data/tmdb_5000_movies.csv")
+        if csv_path and csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                # Le dataset TMDB a "id","title","genres" (genres comme liste de dicts en str)
+                def _genres_to_text(g):
+                    try:
+                        arr = ast.literal_eval(g)
+                        return ", ".join(sorted({d.get("name","") for d in arr if isinstance(d, dict) and d.get("name")}))
+                    except Exception:
+                        return ""
+                movies = pd.DataFrame({
+                    "movie_id": df["id"],
+                    "title":    df["title"].fillna("Titre indisponible"),
+                    "genres":   df["genres"].astype(str).apply(_genres_to_text)
+                })
+            except Exception as e:
+                errors.append(f"tmdb_5000_movies.csv: {e!s}")
+                movies = pd.DataFrame(columns=["movie_id","title","genres"])
+
+    # 3) Message global unique si la reco “modèles” n’est pas prête
+    if (similarity is None):
+        detail = next((e for e in errors if "movie_list.pkl" in e or "similarity.pkl" in e), None) \
+                 or (errors[0] if errors else "movie_list.pkl/similarity.pkl manquants")
+        st.session_state["_reco_global_warn"] = f"⚠️ Données de reco indisponibles ({detail}). Fonctions limitées."
+    else:
+        st.session_state["_reco_global_warn"] = ""
+
+    return movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map
+
+movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map = _load_all()
+
+def HAS_MOVIES(df) -> bool:
+    return df is not None and not getattr(df, "empty", True)
+
 
 
 
