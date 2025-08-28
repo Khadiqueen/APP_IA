@@ -12,5 +12,3 @@ python-dotenv==1.0.1
 streamlit-player==0.1.5
 plotly==5.22.0
 
-# Facultatif (si ça passe, sinon commente cette ligne ET garde un try/except dans le code)
-scikit-surprise==1.1.3
