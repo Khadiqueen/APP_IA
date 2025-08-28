@@ -1487,8 +1487,6 @@ div[data-testid="stSelectbox"] label p { font-size:12px; margin-bottom:2px; }
                     fig_hm2.update_yaxes(title="Mois", showgrid=False)
                     st.plotly_chart(_themed(fig_hm2), use_container_width=True)
 
-
-
 #----- PARTIE 3-------
 # -------- RECOMMANDATION --------
 elif page == "🎬 Recommandation":
@@ -1824,7 +1822,181 @@ elif page == "🎬 Recommandation":
             options += ["Collaboratif (SVD)"]
         if _valid_als():
             options += ["Collaboratif (ALS)"]
-        mode = st.selectbox("M
+        mode = st.selectbox("Mode de recommandation", options, index=0, key="reco_mode_sel")
+
+    # Afficher vos likes (info, pas de boutons ici)
+    if liked_mids:
+        st.markdown("### 🧡 Vos likes (synchro depuis *Recommandation avancée*)")
+        st.markdown('<div class="grid">', unsafe_allow_html=True)
+        for mid in liked_mids[:12]:
+            poster = _safe_fetch_poster(mid, size="w500")
+            st.markdown('<div class="it">', unsafe_allow_html=True)
+            if poster:
+                st.image(poster, width=180, use_container_width=False)
+            st.markdown(f'<div class="cap">{resolve_title(mid)}</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Bouton principal
+    if st.button("🔁 Recommander", key="btn_reco_run"):
+        # index + mid sélectionné (robuste)
+        idx_sel = _find_title_index(movies, selected_movie)
+        selected_mid = None
+        try:
+            if idx_sel is not None:
+                selected_mid = _as_int(movies.iloc[idx_sel]["movie_id"])
+        except Exception:
+            selected_mid = None
+
+        # Recos principales (6) avec fallback durs
+        mids_main = []
+        if mode == "Content-based (cosine)":
+            mids_main = _content_ids_by_title_cached(selected_movie, k=6, same_genre_only=True)
+            if not mids_main:
+                mids_main = _content_ids_by_title_cached(selected_movie, k=6, same_genre_only=False)
+        elif mode == "Collaboratif (SVD)":
+            mids_main = recommend_svd_for_user(k=6)
+            if not mids_main:
+                # fallback sur content
+                mids_main = _content_ids_by_title_cached(selected_movie, k=6, same_genre_only=False)
+        else:  # ALS
+            seed = (liked_mids[-1] if liked_mids else selected_mid)
+            mids_main = recommend_als_for_seed(seed, k=6)
+            if not mids_main:
+                # fallback → SVD → content
+                mids_main = recommend_svd_for_user(k=6) or _content_ids_by_title_cached(
+                    resolve_title(seed) if seed else selected_movie, k=6, same_genre_only=False
+                )
+
+        # Nettoyage final
+        mids_main = [_as_int(m) for m in (mids_main or []) if _as_int(m) is not None]
+        if selected_mid is not None:
+            mids_main = [m for m in mids_main if m != selected_mid]
+        if VALID_IDS:
+            mids_main = [m for m in mids_main if m in VALID_IDS]
+        mids_main = list(dict.fromkeys(mids_main))[:6]
+
+        if not mids_main:
+            st.warning("Aucune recommandation exploitable avec les modèles actuels.")
+        else:
+            for mid in mids_main:
+                meta = resolve_details(mid)
+                title_txt   = meta["title"]
+                overview    = meta["overview"]
+                vote        = meta["vote"]
+                genres_text = meta["genres_text"]
+                runtime_min = meta["runtime_min"]
+                runtime_hr  = minutes_to_hhmm(runtime_min)
+                year        = meta["year"]
+                countries   = meta["countries"]
+
+                # Certification d'âge (si dispo)
+                age_cert = "Accès tout public"
+                try:
+                    rels = (meta["raw"] or {}).get("release_dates", {}).get("results", [])
+                    def pick_cert(cc):
+                        for r in rels:
+                            if r.get("iso_3166_1") == cc:
+                                for c in r.get("release_dates", []):
+                                    cert = (c.get("certification") or "").strip()
+                                    if cert:
+                                        return cert
+                        return None
+                    age_cert = pick_cert("FR") or pick_cert("US") or "Accès tout public"
+                except Exception:
+                    pass
+
+                poster = _safe_fetch_poster(mid, size="w500")
+                watch_url = build_watch_link_fr(title_txt, year)
+
+                c1, c2 = st.columns([1.05, 2])
+                with c1:
+                    if poster:
+                        st.image(poster, caption=f"**{title_txt}**", width=220, use_container_width=False)
+                    else:
+                        st.write(f"**{title_txt}**")
+                with c2:
+                    st.markdown(f"<div class='title-big'>{title_txt}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<span class='badge-genre'>{genres_text}</span>", unsafe_allow_html=True)
+                    st.markdown(
+                        "<div class='note-xxl'><span style='font-size:14px;font-weight:800;opacity:.9;margin-right:8px;'>NOTE</span> "
+                        f"{vote:.1f}</div>",
+                        unsafe_allow_html=True
+                    )
+                    meta_bits = []
+                    if runtime_min:
+                        meta_bits.append(f"🕒 <b>{runtime_hr}</b>")
+                    if year:
+                        meta_bits.append(f"📅 <b>{year}</b>")
+                    if countries:
+                        meta_bits.append(f"🌍 <b>{countries}</b>")
+                    if meta_bits:
+                        st.markdown(f"<div class='meta-line'>{' • '.join(meta_bits)}</div>", unsafe_allow_html=True)
+                    st.markdown("**Synopsis**")
+                    st.write(overview or "Synopsis indisponible.")
+                    st.markdown(f"[▶️ Voir le film / Plus d'infos]({watch_url})")
+
+        # ====== BLOCS SUPPLÉMENTAIRES PILOTÉS PAR LES LIKES (sans boutons) ======
+        if liked_mids:
+            st.markdown("---")
+            # 1) Films similaires (à partir du dernier like)
+            seed_like = liked_mids[-1]
+            seed_title = resolve_title(seed_like)
+            if seed_title:
+                st.markdown(f"### 🎞️ Films similaires à **{seed_title}**")
+                sim_ids = _content_ids_by_title_cached(seed_title, k=8, same_genre_only=True) or \
+                          _content_ids_by_title_cached(seed_title, k=8, same_genre_only=False)
+                if sim_ids:
+                    st.markdown('<div class="grid">', unsafe_allow_html=True)
+                    for mid in sim_ids:
+                        poster = _safe_fetch_poster(mid, size="w500")
+                        st.markdown('<div class="it">', unsafe_allow_html=True)
+                        if poster:
+                            st.image(poster, width=180, use_container_width=False)
+                        st.markdown(f'<div class="cap">{resolve_title(mid)}</div>', unsafe_allow_html=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                else:
+                    st.info("Pas assez de similarités pour ce titre.")
+
+            # 2) Catégorie de films pour vous (genres agrégés des likes)
+            try:
+                like_genres = set()
+                for lm in liked_mids:
+                    row = movies.loc[movies["movie_id"] == lm]
+                    if not row.empty:
+                        gtxt = str(row.iloc[0].get("genres", "")).lower().replace("/", ",")
+                        like_genres |= {p.strip() for p in gtxt.split(",") if p.strip()}
+                if like_genres:
+                    st.markdown("### 📂 Catégorie de films pour vous")
+                    mask = movies["genres"].astype(str).str.lower().apply(
+                        lambda g: any(gen in g for gen in like_genres)
+                    )
+                    subset = movies.loc[mask].copy()
+                    subset = subset[~subset["movie_id"].astype(int).isin(liked_mids)]
+                    subset = subset.sample(min(12, len(subset))) if len(subset) else subset
+
+                    if not subset.empty:
+                        st.markdown('<div class="grid">', unsafe_allow_html=True)
+                        for _, row in subset.iterrows():
+                            mid = _as_int(row["movie_id"])
+                            if mid is None:
+                                continue
+                            poster = _safe_fetch_poster(mid, size="w500")
+                            st.markdown('<div class="it">', unsafe_allow_html=True)
+                            if poster:
+                                st.image(poster, width=180, use_container_width=False)
+                            st.markdown(f'<div class="cap">{resolve_title(mid)}</div>', unsafe_allow_html=True)
+                            st.markdown('</div>', unsafe_allow_html=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    else:
+                        st.info("Pas de titres trouvés sur vos catégories préférées.")
+            except Exception:
+                pass
+
+    st.stop()
+
+
 
 
 
