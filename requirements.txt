@@ -1,14 +1,13 @@
-# === Base Streamlit Cloud (légère) ===
-streamlit>=1.32,<2
-numpy==1.26.4
-pandas==2.2.2
-scipy==1.12.0
-scikit-learn==1.4.2
-requests==2.31.0
-pillow==10.2.0
-gTTS==2.5.1
-Markdown==3.5.2
-python-dotenv==1.0.1
-streamlit-player==0.1.5
-plotly==5.22.0
-
+streamlit
+numpy
+pandas
+scipy
+scikit-learn
+requests
+pillow
+gTTS
+Markdown
+python-dotenv
+streamlit-player
+plotly
+groq
