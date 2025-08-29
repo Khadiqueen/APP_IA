@@ -1,68 +1,70 @@
 # -*- coding: utf-8 -*-
-import streamlit as st
-import pandas as pd
-import pickle
-import requests
-import uuid
+from __future__ import annotations
+
+# =============== IMPORTS ===============
 import os
-from gtts import gTTS
-from groq import Groq
+import ast
 import json
+import time
+import uuid
 from datetime import datetime
-from dotenv import load_dotenv
-
-load_dotenv()  # charge .env dans os.environ
-
-
-# --- Feedback (likes/dislikes) partagé entre l'app et le notebook ---
 from pathlib import Path
-import json, time, os
 
-FEEDBACK_PATH = Path("data") / "chat_history.json"
-FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)  # crée ./data/ si absent
+import requests
+import pandas as pd
+import numpy as np
+import streamlit as st
+import pickle
 
-def log_feedback(mid: int, action: str, path: str | os.PathLike = FEEDBACK_PATH):
-    """
-    mid: TMDB movie_id
-    action: "like" ou "dislike"
-    """
-    entry = {"mid": int(mid), "action": str(action), "ts": time.time()}
-    try:
-        data = json.load(open(path, "r", encoding="utf-8")) if os.path.exists(path) else []
-    except Exception:
-        data = []
-    data.append(entry)
-    json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+# Dépendances optionnelles (ne doivent pas faire planter si absentes)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # charge .env dans os.environ
+except Exception:
+    pass
 
-from pathlib import Path
-import json, time, os
+try:
+    from gtts import gTTS
+except Exception:
+    gTTS = None
 
-BASE_DIR = Path(__file__).resolve().parent       # ← dossier de App.py (APP/)
-FEEDBACK_PATH = BASE_DIR / "data" / "chat_history.json"
-FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
 
-def log_feedback(mid: int, action: str, path: Path = FEEDBACK_PATH):
-    entry = {"mid": int(mid), "action": str(action), "ts": time.time()}
-    try:
-        data = json.load(open(path, "r", encoding="utf-8")) if path.exists() else []
-    except Exception:
-        data = []
-    data.append(entry)
-    json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+try:
+    from streamlit_player import st_player
+except Exception:
+    st_player = None
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except Exception:
+    TfidfVectorizer = None
+    cosine_similarity = None
 
 
-
-# ================== CONFIG GLOBALE ==================
+# =============== CONFIG GLOBALE ===============
 st.set_page_config(page_title="FilmScope IA", page_icon="🎥", layout="wide")
 
-# ======== Invalidation AUTOMATIQUE du cache (version + fichiers + env) ========
-APP_VERSION = "1.0.0"  # incrémente quand tu veux forcer un refresh global
+BASE_DIR = Path(__file__).resolve().parent  # dossier de App.py
+APP_VERSION = "1.0.0"  # incrémente pour invalider les caches
 
 def _compute_cache_fingerprint() -> str:
+    """
+    Invalide les caches Streamlit si l'un de ces fichiers change ou si la version change.
+    """
     parts = [APP_VERSION, os.getenv("TMDB_API_KEY", "")]
-    for fp in ("movie_list.pkl", "similarity.pkl", ".env"):
+    candidates = (
+        "movie_list.pkl", "similarity.pkl",
+        "models/movie_list.pkl", "models/similarity.pkl",
+        "data/tmdb_5000_movies.csv", ".env"
+    )
+    for fp in candidates:
         try:
-            parts.append(str(int(os.path.getmtime(fp))))
+            parts.append(str(int((BASE_DIR / fp).stat().st_mtime)))
         except Exception:
             parts.append("0")
     return "|".join(parts)
@@ -75,25 +77,15 @@ if st.session_state.get("_CACHE_FP") != _FP:
     except Exception:
         pass
     st.session_state["_CACHE_FP"] = _FP
-# ========================================================================
-# ========================================================================
-# --------- Thème : Noir / Doré / Bordeaux (look Netflix/Amazon) ---------
+
+
+# =============== STYLES ===============
 st.markdown("""
 <style>
 :root {
-  --noir:#000;
-  --blanc:#fff;
-  --dore:#FFD700;
-  --bordeaux:#7A1F1F;
-  --fond:#0b0b0b;
-  --fond-side:#111;
-  --gris:#1a1a1a;
-
-  /* Unification des tailles */
-  --btn-h: 40px;
-  --btn-radius: 12px;
-  --poster-w: 220px;
-  --poster-h: 330px;
+  --noir:#000; --blanc:#fff; --dore:#FFD700; --bordeaux:#7A1F1F;
+  --fond:#0b0b0b; --fond-side:#111; --gris:#1a1a1a;
+  --btn-h: 40px; --btn-radius: 12px; --poster-w: 220px; --poster-h: 330px;
 }
 
 /* Base */
@@ -101,11 +93,11 @@ html, body, [class*="css"] {
   background: var(--noir) !important;
   color: var(--blanc) !important;
   font-family: "Times New Roman", Times, serif !important;
-  font-weight: 400 !important;     /* normal (pas gras) */
-  font-size: 1.05rem !important;   /* +5% environ */
+  font-weight: 400 !important;
+  font-size: 1.05rem !important;
 }
 
-/* Boutons (taille réduite & uniforme) */
+/* Boutons */
 .stButton>button {
   background: linear-gradient(90deg, var(--dore), var(--bordeaux));
   color: var(--noir) !important;
@@ -114,7 +106,6 @@ html, body, [class*="css"] {
   height: var(--btn-h);
   padding: 0 14px;
   font-size: .95rem;
-  width: auto;
   min-width: 140px;
   transition: transform .12s ease-in-out, box-shadow .12s ease-in-out;
   box-shadow: 0 2px 10px rgba(122,31,31,0.35);
@@ -195,18 +186,7 @@ html, body, [class*="css"] {
 .hero h1 { font-size: 34px; margin: 0 0 6px 0; color: var(--dore); }
 .hero p { color: rgba(255,255,255,0.92); margin: 0 0 10px 0; }
 
-/* Footer */
-.footer-global {
-  margin-top: 28px;
-  padding: 12px 0;
-  text-align: center;
-  font-size: 13.5px;
-  color: rgba(255,255,255,0.9);
-  border-top: 1px solid rgba(255,215,0,0.28);
-}
-.footer-global a { color: var(--dore); text-decoration: none; }
-
-/* Images: taille UNIFORME + hover — uniquement dans le contenu principal */
+/* Images uniformisées */
 [data-testid="stAppViewContainer"] .stImage img,
 [data-testid="stAppViewContainer"] .poster-fixed {
   width: var(--poster-w) !important;
@@ -223,7 +203,7 @@ html, body, [class*="css"] {
   border-color: rgba(255,215,0,0.45);
 }
 
-/* Vignette avec badge circulaire (genres) */
+/* Vignette poster + badge */
 .poster-wrap {
   position: relative;
   display: inline-block;
@@ -234,560 +214,252 @@ html, body, [class*="css"] {
   border: 1px solid rgba(255,215,0,0.25);
   background: #000;
 }
-.poster-wrap img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
+.poster-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .genre-badge-circle {
   position: absolute;
-  top: 10px;
-  left: 10px;
-  width: 50px;
-  height: 50px;
-  min-width: 50px;
+  top: 10px; left: 10px;
+  width: 50px; height: 50px; min-width: 50px;
   border-radius: 50%;
-  background: rgba(255,215,0,0.92);
-  color: #000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 900;
-  font-size: 11px;
-  text-align: center;
-  line-height: 1.05;
-  padding: 6px;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+  background: rgba(255,215,0,0.92); color: #000;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 900; font-size: 11px; text-align: center; line-height: 1.05;
+  padding: 6px; box-shadow: 0 2px 10px rgba(0,0,0,0.35);
   border: 1px solid rgba(122,31,31,0.35);
 }
-.genre-badge-circle small {
-  display: block;
-  font-size: 10px;
-  font-weight: 800;
-}
+.genre-badge-circle small { display:block; font-size:10px; font-weight:800; }
 
-/* Mini ajustement des selects pour compacité */
-.stSelectbox label, .stMultiSelect label {
-  font-size: .95rem;
-}
-</style>
-""", unsafe_allow_html=True)
-
-
-# --- Override CSS pour le logo du sidebar (plein, sans hover ni cadre)
-st.markdown("""
-<style>
-/* Sidebar : logo plat, sans cadre ni hover */
+/* Sidebar : logo plat */
 [data-testid="stSidebar"] .stImage,
 [data-testid="stSidebar"] .stImage > figure{
-  margin: 0 !important;
-  padding: 0 !important;
-  background: transparent !important;
-  border: none !important;
-  box-shadow: none !important;
+  margin: 0 !important; padding: 0 !important; background: transparent !important;
+  border: none !important; box-shadow: none !important;
 }
-
-/* Image du logo : pleine largeur, proportions respectées, aucun effet */
 [data-testid="stSidebar"] .stImage img{
-  width: 100% !important;
-  max-width: 520px !important;
-  height: auto !important;
-  object-fit: contain !important;
-  border: none !important;
-  border-radius: 0 !important;
-  box-shadow: none !important;
-  transform: none !important;
-  transition: none !important;
-}
-
-/* Neutralise tout hover */
-[data-testid="stSidebar"] .stImage img:hover{
-  transform: none !important;
-  box-shadow: none !important;
-  border: none !important;
+  width: 100% !important; max-width: 520px !important; height: auto !important;
+  object-fit: contain !important; border: none !important; border-radius: 0 !important;
+  box-shadow: none !important; transform: none !important; transition: none !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
 
+# =============== FEEDBACK (likes/dislikes) partagé ===============
+FEEDBACK_PATH = BASE_DIR / "data" / "chat_history.json"
+FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# ================== IMPORTS OPTIONNELS ==================
-try:
-    from streamlit_player import st_player
-except Exception:
-    st_player = None
-
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-except Exception:
-    TfidfVectorizer = None
-    cosine_similarity = None
-
-# ---------- Helpers de cache pour TMDB (à mettre au-dessus des pages) ----------
-@st.cache_data(show_spinner=False, ttl=3600)
-def tmdb_movie_cached(mid: int):
-    return tmdb_get(f"movie/{mid}") or {}
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_overview_vote_genres_fast(movie_id):
-    data = tmdb_movie_cached(movie_id)
-    overview = data.get("overview") or "Description indisponible..."
-    genres = ", ".join([g["name"] for g in data.get("genres", [])]) or "Genres indisponibles"
-    return overview, genres, data
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_poster_fast(movie_id, size="w185"):
-    data = tmdb_movie_cached(movie_id)
-    p = data.get('poster_path')
-    return f"https://image.tmdb.org/t/p/{size}{p}" if p else "https://via.placeholder.com/300x450.png?text=No+Image"
-
-# ================== DONNÉES ==================
-def load_pickles():
+def log_feedback(mid: int, action: str, path: Path = FEEDBACK_PATH):
+    """
+    mid: TMDB movie_id ; action: "like" ou "dislike"
+    """
+    entry = {"mid": int(mid), "action": str(action), "ts": time.time()}
     try:
-        movies = pickle.load(open('movie_list.pkl', 'rb'))
-        similarity = pickle.load(open('similarity.pkl', 'rb'))
-        if 'title' not in movies.columns or 'movie_id' not in movies.columns:
-            raise ValueError("Colonnes attendues absentes (title, movie_id)")
-        return movies, similarity
-    except Exception as e:
-        st.warning(f"⚠️ Données de reco indisponibles ({e}). Fonctions limitées.")
-        return pd.DataFrame(columns=['title','movie_id']), None
+        data = json.load(open(path, "r", encoding="utf-8")) if path.exists() else []
+    except Exception:
+        data = []
+    data.append(entry)
+    json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-movies, similarity = load_pickles()
 
-# ================== TMDB ==================
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "8265bd1679663a7ea12ac168da84d2e8")
+# =============== TMDB (helpers) ===============
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "8265bd1679663a7ea12ac168da84d2e8")  # fallback démo
 TMDB_LANG = "fr-FR"
+_TMDB_IMG = "https://image.tmdb.org/t/p/"
 
-def tmdb_get(path, params=None):
-    base = "https://api.themoviedb.org/3"
-    params = params or {}
-    params["api_key"] = TMDB_API_KEY
-    params["language"] = TMDB_LANG
+def _tmdb_key() -> str:
     try:
-        r = requests.get(f"{base}/{path}", params=params, timeout=10)
+        k = st.secrets.get("TMDB_API_KEY")
+    except Exception:
+        k = None
+    return k or TMDB_API_KEY or ""
+
+def tmdb_get(path: str, params: dict = None) -> dict:
+    base = "https://api.themoviedb.org/3"
+    params = dict(params or {})
+    params["api_key"] = _tmdb_key()
+    if "language" not in params:
+        params["language"] = TMDB_LANG
+    try:
+        r = requests.get(f"{base}/{path.lstrip('/')}", params=params, timeout=12)
         if r.status_code == 200:
-            return r.json()
+            return r.json() or {}
     except Exception:
         pass
     return {}
 
-def fetch_poster(movie_id, size="w300"):
-    data = tmdb_get(f"movie/{movie_id}")
-    p = data.get('poster_path')
-    return f"https://image.tmdb.org/t/p/{size}{p}" if p else "https://via.placeholder.com/300x450.png?text=No+Image"
+@st.cache_data(show_spinner=False, ttl=3600)
+def tmdb_movie_cached(mid: int) -> dict:
+    return tmdb_get(f"movie/{mid}") or {}
 
-def fetch_overview_vote_genres(movie_id):
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_overview_vote_genres_fast(movie_id: int):
+    data = tmdb_movie_cached(movie_id)
+    overview = data.get("overview") or "Description indisponible..."
+    genres = ", ".join([g.get("name","") for g in data.get("genres", [])]) or "Genres indisponibles"
+    return overview, genres, data
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_poster_fast(movie_id: int, size: str = "w185") -> str:
+    data = tmdb_movie_cached(movie_id)
+    p = data.get("poster_path")
+    return f"{_TMDB_IMG}{size}{p}" if p else "https://via.placeholder.com/300x450.png?text=No+Image"
+
+def fetch_poster(movie_id: int, size: str = "w300") -> str:
+    data = tmdb_get(f"movie/{movie_id}")
+    p = data.get("poster_path")
+    return f"{_TMDB_IMG}{size}{p}" if p else "https://via.placeholder.com/300x450.png?text=No+Image"
+
+def fetch_overview_vote_genres(movie_id: int):
     data = tmdb_get(f"movie/{movie_id}")
     overview = data.get("overview") or "Description indisponible."
     vote = data.get("vote_average", 0.0)
-    genres = ", ".join([g["name"] for g in data.get("genres", [])]) or "Genres indisponibles"
+    genres = ", ".join([g.get("name","") for g in data.get("genres", [])]) or "Genres indisponibles"
     return overview, vote, genres, data
 
-def get_trailer_url(movie_id):
-    data = tmdb_get(f"movie/{movie_id}/videos")
-    for v in data.get("results", []):
-        if v.get("type") == "Trailer" and v.get("site") == "YouTube":
-            return f"https://www.youtube.com/watch?v={v['key']}"
+def get_trailer_url(movie_id: int):
+    # Cherche d'abord FR, puis EN
+    for lang in (TMDB_LANG, "en-US"):
+        data = tmdb_get(f"movie/{movie_id}/videos", params={"language": lang})
+        for v in data.get("results", []):
+            if v.get("type") == "Trailer" and v.get("site") == "YouTube" and v.get("key"):
+                return f"https://www.youtube.com/watch?v={v['key']}"
     return None
 
-def tmdb_similar(movie_id, limit=6):
+def tmdb_similar(movie_id: int, limit: int = 6):
     data = tmdb_get(f"movie/{movie_id}/similar")
-    return [m["id"] for m in data.get("results", [])][:limit]
+    return [m.get("id") for m in data.get("results", []) if m.get("id")] [:limit]
 
-def tmdb_collection(movie_id):
+def tmdb_collection(movie_id: int):
     _, _, _, data = fetch_overview_vote_genres(movie_id)
     col = data.get("belongs_to_collection")
     if not col:
         return []
     col_id = col.get("id")
     c = tmdb_get(f"collection/{col_id}") if col_id else {}
-    return [m["id"] for m in c.get("parts", [])] if c else []
+    return [m.get("id") for m in c.get("parts", []) if m.get("id")]
 
-def tmdb_popular(limit=12, reverse=False):
+def tmdb_popular(limit: int = 12, reverse: bool = False):
     p1 = tmdb_get("movie/popular", params={"page": 1}).get("results", [])
     p2 = tmdb_get("movie/popular", params={"page": 2}).get("results", [])
     allm = p1 + p2
     allm = sorted(allm, key=lambda m: m.get("popularity", 0), reverse=not reverse)
     return allm[:limit]
 
-def tmdb_by_genre(genre_ids, limit=12):
-    res = tmdb_get("discover/movie", params={"with_genres": ",".join(map(str, genre_ids)), "sort_by": "vote_average.desc", "vote_count.gte": 50})
+def tmdb_by_genre(genre_ids: list, limit: int = 12):
+    if not genre_ids:
+        return []
+    res = tmdb_get("discover/movie", params={
+        "with_genres": ",".join(map(str, genre_ids)),
+        "sort_by": "vote_average.desc",
+        "vote_count.gte": 50
+    })
     return res.get("results", [])[:limit]
-
-def get_movie_id(title):
-    row = movies[movies['title'].str.lower() == title.lower()]
-    return int(row.iloc[0]['movie_id']) if not row.empty else None
 
 def tmdb_search_title(title: str):
     js = tmdb_get("search/movie", params={"query": title, "include_adult": False})
     return js.get("results", [])
 
-def tmdb_details_full(movie_id: int):
-    d = tmdb_get(f"movie/{movie_id}")
-    release = d.get("release_date") or ""
-    runtime = d.get("runtime") or 0
-    genres = ", ".join([g["name"] for g in d.get("genres", [])]) or "Genres indisponibles"
-    vote = float(d.get("vote_average") or 0)
-    vc = int(d.get("vote_count") or 0)
-    pop = d.get("popularity", 0)
-    poster = f"https://image.tmdb.org/t/p/w500{d.get('poster_path')}" if d.get("poster_path") else "https://via.placeholder.com/300x450.png?text=No+Image"
-    overview = d.get("overview") or "Description indisponible."
-    title = d.get("title") or d.get("name") or "Titre indisponible"
-    return {
-        "title": title, "overview": overview, "vote": vote, "vote_count": vc,
-        "popularity": pop, "genres": genres, "release_date": release,
-        "runtime": runtime, "poster": poster
-    }
 
-# ================== UTILS RECO (nécessaires aux pages) ==================
-def recommend_titles_by_title(title, k=6):
-    if movies.empty or title not in movies['title'].values or similarity is None:
+# =============== DONNÉES (pickles -> fallback CSV) ===============
+@st.cache_resource
+def load_pickles():
+    """
+    Charge movie_list.pkl / similarity.pkl si présents,
+    sinon essaie data/tmdb_5000_movies.csv pour ne pas laisser l'app vide.
+    """
+    # 1) Pickles
+    try:
+        p_movies = None
+        for cand in ("movie_list.pkl", "models/movie_list.pkl"):
+            if (BASE_DIR / cand).exists():
+                p_movies = pickle.load(open(BASE_DIR / cand, "rb"))
+                break
+
+        p_sim = None
+        for cand in ("similarity.pkl", "models/similarity.pkl"):
+            if (BASE_DIR / cand).exists():
+                p_sim = pickle.load(open(BASE_DIR / cand, "rb"))
+                break
+
+        if isinstance(p_movies, pd.DataFrame) and not p_movies.empty \
+           and {"title","movie_id"}.issubset(p_movies.columns):
+            return p_movies, p_sim
+    except Exception as e:
+        st.warning(f"⚠️ Données pickles non chargées ({e}). On tente le CSV.")
+
+    # 2) Fallback CSV
+    csv_path = BASE_DIR / "data" / "tmdb_5000_movies.csv"
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path)
+            def _genres_to_text(g):
+                try:
+                    arr = ast.literal_eval(str(g))
+                    return ", ".join(sorted({d.get("name","") for d in arr if isinstance(d, dict) and d.get("name")}))
+                except Exception:
+                    return ""
+            movies = pd.DataFrame({
+                "movie_id": df["id"],
+                "title":    df["title"].fillna("Titre indisponible"),
+                "genres":   df["genres"].apply(_genres_to_text)
+            })
+            return movies, None
+        except Exception as e:
+            st.warning(f"⚠️ Lecture CSV échouée ({e}).")
+    # 3) Vide
+    return pd.DataFrame(columns=["movie_id","title","genres"]), None
+
+movies, similarity = load_pickles()
+
+# Message global si reco avancée indisponible
+if similarity is None:
+    st.session_state["_reco_global_warn"] = "⚠️ Données de reco indisponibles (movie_list.pkl/similarity.pkl manquants). Fonctions limitées."
+else:
+    st.session_state["_reco_global_warn"] = ""
+
+
+# =============== UTILS RECO ==================
+def recommend_titles_by_title(title: str, k: int = 6):
+    if movies.empty or title not in movies["title"].values or similarity is None:
         return []
-    idx = movies[movies['title'] == title].index[0]
+    idx = movies[movies["title"] == title].index[0]
     scores = list(enumerate(similarity[idx]))
     scores = sorted(scores, key=lambda x: x[1], reverse=True)[1:k+1]
     return [movies.iloc[i].title for i, _ in scores]
 
-def recommend_by_genres(genres, limit=8):
-    if movies.empty:
-        return []
-    titles = []
-    for _, row in movies.sample(min(200, len(movies))).iterrows():
-        mid = int(row['movie_id'])
-        _, _, g, _ = fetch_overview_vote_genres(mid)
-        if any(gg.strip().lower() in g.lower() for gg in genres):
-            titles.append(row['title'])
-        if len(titles) >= limit:
-            break
-    return list(dict.fromkeys(titles))[:limit]
-
-
-
-# ================== SIDEBAR ==================
-logo_path = "images/film.png" if os.path.exists("images/film.png") else None
-
-with st.sidebar:
-    if logo_path:
-        st.markdown('<div class="sidebar-logo" style="text-align:center; padding:0; margin:0;">', unsafe_allow_html=True)
-        st.image(logo_path, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # Navigation (unique)
-    page = st.selectbox(
-        "Navigation",
-        ["🏠 Accueil","📊 Visualisation" ,"🎬 Recommandation", "📈 Prédiction Machine Learning",
-         "🧠 Recommandation avancée", "💬 FilmScope Chatbot"],
-        key="nav_page_select"
-    )
- 
-    # Contenu spécifique au Chatbot dans le même sidebar (historique + bouton clear)
-    if page == "💬 FilmScope Chatbot":
-        st.markdown("---")
-        st.header("🗂️ Historique")
-        if st.session_state.get("history"):
-            for m in reversed(st.session_state.history):
-                who = "👤" if m["role"] == "user" else "🎬"
-                st.write(f"{who} {m['content']}")
-        else:
-            st.caption("L'historique apparaît ici après vos échanges.")
-
-        if st.button("🧹 Effacer l'historique", key="clear_hist_btn", use_container_width=True):
-            st.session_state.history = []
-            st.session_state.last_audio_b64 = None
-            st.toast("Historique effacé.")
-
-# === Historique: sauvegarde/chargement ===
-HIST_FILE = "chat_history.json"
-def save_chat_history():
-    try:
-        with open(HIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(st.session_state.chat_history, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.error(f"Erreur sauvegarde historique : {e}")
-
-def load_chat_history():
-    if os.path.exists(HIST_FILE):
-        try:
-            with open(HIST_FILE, "r", encoding="utf-8") as f:
-                st.session_state.chat_history = json.load(f)
-        except Exception:
-            st.session_state.chat_history = []
-
-from pathlib import Path
-import pickle, numpy as np, pandas as pd
-import streamlit as st
-import ast
-
-@st.cache_resource
-def _load_all():
-    base = Path(__file__).resolve().parent
-    errors = []
-
-    def _pick(*cands):
-        for rp in cands:
-            p = (base / rp).resolve()
-            if p.exists():
-                return p
-        return None
-
-    def _load_pickle(*cands):
-        p = _pick(*cands)
-        if not p:
-            errors.append(f"{cands[0]}: No such file or directory")
-            return None
-        try:
-            with open(p, "rb") as f:
-                return pickle.load(f)
-        except Exception as e:
-            errors.append(f"{p.name}: {e!s}")
-            return None
-
-    def _load_numpy(*cands):
-        p = _pick(*cands)
-        if not p:
-            errors.append(f"{cands[0]}: No such file or directory")
-            return None
-        try:
-            return np.load(p, allow_pickle=True)
-        except Exception as e:
-            errors.append(f"{p.name}: {e!s}")
-            return None
-
-    # 1) Tentative : modèles pré-calculés
-    movies        = _load_pickle("models/movie_list.pkl", "movie_list.pkl")
-    similarity    = _load_pickle("models/similarity.pkl", "similarity.pkl")
-    svd_model     = _load_pickle("models/svd_model.pkl", "svd_model.pkl")
-    svd_items     = _load_pickle("models/svd_items.pkl", "svd_items.pkl") or []
-    als_item_f    = _load_numpy("models/als_item_factors.npy", "als_item_factors.npy")
-    als_user_f    = _load_numpy("models/als_user_factors.npy", "als_user_factors.npy")
-    als_items_map = _load_pickle("models/als_items.pkl", "als_items.pkl") or {}
-
-    # 2) Fallback : reconstruire un minimum depuis tes CSV (pour ne PAS afficher une page vide)
-    if movies is None or getattr(movies, "empty", True):
-        csv_path = _pick("data/tmdb_5000_movies.csv")
-        if csv_path and csv_path.exists():
-            try:
-                df = pd.read_csv(csv_path)
-                # Le dataset TMDB a "id","title","genres" (genres comme liste de dicts en str)
-                def _genres_to_text(g):
-                    try:
-                        arr = ast.literal_eval(g)
-                        return ", ".join(sorted({d.get("name","") for d in arr if isinstance(d, dict) and d.get("name")}))
-                    except Exception:
-                        return ""
-                movies = pd.DataFrame({
-                    "movie_id": df["id"],
-                    "title":    df["title"].fillna("Titre indisponible"),
-                    "genres":   df["genres"].astype(str).apply(_genres_to_text)
-                })
-            except Exception as e:
-                errors.append(f"tmdb_5000_movies.csv: {e!s}")
-                movies = pd.DataFrame(columns=["movie_id","title","genres"])
-
-    # 3) Message global unique si la reco “modèles” n’est pas prête
-    if (similarity is None):
-        detail = next((e for e in errors if "movie_list.pkl" in e or "similarity.pkl" in e), None) \
-                 or (errors[0] if errors else "movie_list.pkl/similarity.pkl manquants")
-        st.session_state["_reco_global_warn"] = f"⚠️ Données de reco indisponibles ({detail}). Fonctions limitées."
-    else:
-        st.session_state["_reco_global_warn"] = ""
-
-    return movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map
-
-movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map = _load_all()
-
-def HAS_MOVIES(df) -> bool:
-    return df is not None and not getattr(df, "empty", True)
-
-
-
-# ========= Imports & Helpers globaux (robustes Cloud/Local) =========
-from __future__ import annotations
-import os, ast, requests
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import streamlit as st
-
-# streamlit-player est facultatif (ne doit pas crasher si absent)
-try:
-    from streamlit_player import st_player
-except Exception:
-    st_player = None
-
-# ---------- TMDB helpers ----------
-def _tmdb_key() -> str:
-    try:
-        k = st.secrets.get("TMDB_API_KEY")
-    except Exception:
-        k = None
-    return k or os.getenv("TMDB_API_KEY") or ""
-
-_TMDB_IMG = "https://image.tmdb.org/t/p/"
-
-def tmdb_get(path: str, params: dict | None = None) -> dict:
-    key = _tmdb_key()
-    if not key:
-        return {}
-    url = f"https://api.themoviedb.org/3/{path.lstrip('/')}"
-    p = dict(params or {})
-    p["api_key"] = key  # API v3
-    try:
-        r = requests.get(url, params=p, timeout=12)
-        r.raise_for_status()
-        return r.json() or {}
-    except Exception:
-        return {}
-
-def tmdb_search_title(title: str, lang: str = "fr-FR") -> dict | None:
-    if not title:
-        return None
-    d = tmdb_get("search/movie", {"query": title, "language": lang})
-    res = (d.get("results") or [])
-    return res[0] if res else None
-
-def fetch_overview_vote_genres_fast(mid: int, lang: str = "fr-FR"):
-    d = tmdb_get(f"movie/{mid}", {"language": lang}) or {}
-    ov = d.get("overview") or ""
-    genres = ", ".join([g.get("name","") for g in (d.get("genres") or []) if g.get("name")])
-    return ov, genres, d
-
-def fetch_poster(mid: int, size: str = "w500", lang: str = "fr-FR") -> str:
-    d = tmdb_get(f"movie/{mid}", {"language": lang}) or {}
-    pp = d.get("poster_path")
-    return f"{_TMDB_IMG}{size}{pp}" if pp else "https://via.placeholder.com/300x450.png?text=No+Image"
-
-def get_trailer_url(mid: int) -> str | None:
-    for lang in ("fr-FR", "en-US"):
-        d = tmdb_get(f"movie/{mid}/videos", {"language": lang}) or {}
-        vids = d.get("results") or []
-        for v in vids:
-            if v.get("site") == "YouTube" and v.get("type") == "Trailer" and v.get("key"):
-                return f"https://www.youtube.com/watch?v={v['key']}"
-    return None
-
-def tmdb_by_genre(genre_ids: list[int], limit: int = 8, lang: str = "fr-FR") -> list[dict]:
-    if not genre_ids:
-        return []
-    d = tmdb_get("discover/movie", {
-        "with_genres": ",".join(map(str, genre_ids)),
-        "sort_by": "popularity.desc",
-        "language": lang, "page": 1
-    })
-    return (d.get("results") or [])[:limit]
-
-def tmdb_popular(limit: int = 8, lang: str = "fr-FR") -> list[dict]:
-    d = tmdb_get("movie/popular", {"language": lang, "page": 1})
-    return (d.get("results") or [])[:limit]
-
-# ---------- Chargement résilient des données (pickles -> CSV fallback) ----------
-@st.cache_resource
-def _load_all():
-    base = Path(__file__).resolve().parent
-
-    def _pick(*cands):
-        for rp in cands:
-            p = (base / rp).resolve()
-            if p.exists():
-                return p
-        return None
-
-    def _load_pickle(*cands):
-        p = _pick(*cands)
-        if not p:
-            return None
-        try:
-            import pickle
-            with open(p, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            return None
-
-    def _load_numpy(*cands):
-        p = _pick(*cands)
-        if not p:
-            return None
-        try:
-            return np.load(p, allow_pickle=True)
-        except Exception:
-            return None
-
-    # Pickles pré-calculés (Git LFS)
-    movies        = _load_pickle("models/movie_list.pkl", "movie_list.pkl")
-    similarity    = _load_pickle("models/similarity.pkl", "similarity.pkl")
-    svd_model     = _load_pickle("models/svd_model.pkl", "svd_model.pkl")
-    svd_items     = _load_pickle("models/svd_items.pkl", "svd_items.pkl") or []
-    als_item_f    = _load_numpy("models/als_item_factors.npy", "als_item_factors.npy")
-    als_user_f    = _load_numpy("models/als_user_factors.npy", "als_user_factors.npy")
-    als_items_map = _load_pickle("models/als_items.pkl", "als_items.pkl") or {}
-
-    # Fallback CSV si pas de pickles
-    if movies is None or getattr(movies, "empty", True):
-        csv_path = _pick("data/tmdb_5000_movies.csv")
-        if csv_path and csv_path.exists():
-            try:
-                df = pd.read_csv(csv_path)
-                def _genres_to_text(g):
-                    try:
-                        arr = ast.literal_eval(str(g))
-                        return ", ".join(sorted({d.get("name","") for d in arr if isinstance(d, dict) and d.get("name")}))
-                    except Exception:
-                        return ""
-                movies = pd.DataFrame({
-                    "movie_id": df["id"],
-                    "title":    df["title"].fillna("Titre indisponible"),
-                    "genres":   df["genres"].apply(_genres_to_text)
-                })
-            except Exception:
-                movies = pd.DataFrame(columns=["movie_id","title","genres"])
-        else:
-            movies = pd.DataFrame(columns=["movie_id","title","genres"])
-
-    # Message global si la reco avancée n’est pas prête (pickles manquants)
-    if similarity is None:
-        st.session_state["_reco_global_warn"] = "⚠️ Données de reco indisponibles (movie_list.pkl/similarity.pkl manquants). Fonctions limitées."
-    else:
-        st.session_state["_reco_global_warn"] = ""
-
-    return movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map
-
-movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map = _load_all()
-
-def HAS_MOVIES(df) -> bool:
-    return df is not None and not getattr(df, "empty", True)
-
-# ---------- Utilitaires Accueil ----------
 def _norm_txt(s: str) -> str:
     import unicodedata, re
     s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("ascii")
     s = re.sub(r"[-–—]", " ", s)
     return s.lower().strip()
 
-def get_movie_id(title: str) -> int | None:
-    """Retrouve l’id pour un titre via le CSV local, sinon via TMDB search."""
+def HAS_MOVIES(df) -> bool:
+    return df is not None and isinstance(df, pd.DataFrame) and not df.empty
+
+def get_movie_id(title: str):
+    """
+    Retrouve l’ID via le CSV local, sinon via TMDB search.
+    """
     if not title:
         return None
-    # Local
-    if HAS_MOVIES(movies) and "title" in movies.columns and "movie_id" in movies.columns:
+    if HAS_MOVIES(movies) and {"title","movie_id"}.issubset(movies.columns):
         try:
             row = movies.loc[movies["title"].astype(str).str.lower() == title.lower()].head(1)
             if not row.empty:
                 return int(row.iloc[0]["movie_id"])
         except Exception:
             pass
-    # TMDB
-    hit = tmdb_search_title(title)
-    if hit and hit.get("id"):
-        return int(hit["id"])
+    hit = (tmdb_search_title(title) or [])
+    if hit:
+        mid = hit[0].get("id")
+        return int(mid) if mid else None
     return None
 
-def recommend_by_genres(genres: list[str], limit: int = 8) -> list[str]:
-    """Reco légère: filtre le CSV par genres puis complète avec TMDB popular."""
+def recommend_by_genres(genres: list, limit: int = 8) -> list:
+    """
+    Reco légère: filtre le CSV par genres puis complète avec TMDB popular.
+    """
     want = [_norm_txt(g) for g in (genres or [])]
-    out: list[str] = []
+    out = []
 
     if HAS_MOVIES(movies) and want:
         try:
@@ -812,104 +484,118 @@ def recommend_by_genres(genres: list[str], limit: int = 8) -> list[str]:
     return out
 
 
-# ================== PAGES ==================
-if page == "🏠 Accueil":
-    # Alerte globale (pickles manquants / mode limité)
-    if st.session_state.get("_reco_global_warn"):
-        st.warning(st.session_state["_reco_global_warn"])
+# =============== HISTORIQUE CHATBOT (sidebar) ===============
+# Fichier d'historique : on réutilise data/chat_history.json
+HIST_FILE = str(FEEDBACK_PATH)
 
-    # ====== TITRE EN HAUT ======
+def save_chat_history():
+    try:
+        with open(HIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(st.session_state.chat_history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.error(f"Erreur sauvegarde historique : {e}")
+
+def load_chat_history():
+    if os.path.exists(HIST_FILE):
+        try:
+            with open(HIST_FILE, "r", encoding="utf-8") as f:
+                st.session_state.chat_history = json.load(f)
+        except Exception:
+            st.session_state.chat_history = []
+    else:
+        st.session_state.chat_history = []
+
+if "chat_history" not in st.session_state:
+    load_chat_history()
+
+
+# =============== SIDEBAR ==================
+logo_path = BASE_DIR / "images" / "film.png"
+with st.sidebar:
+    if logo_path.exists():
+        st.markdown('<div class="sidebar-logo" style="text-align:center; padding:0; margin:0;">', unsafe_allow_html=True)
+        st.image(str(logo_path), use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    page = st.selectbox(
+        "Navigation",
+        ["🏠 Accueil","📊 Visualisation" ,"🎬 Recommandation", "📈 Prédiction Machine Learning",
+         "🧠 Recommandation avancée", "💬 FilmScope Chatbot"],
+        key="nav_page_select"
+    )
+
+    # Historique du chatbot dans la sidebar
+    if page == "💬 FilmScope Chatbot":
+        st.markdown("---")
+        st.header("🗂️ Historique")
+        if st.session_state.get("chat_history"):
+            for m in reversed(st.session_state.chat_history):
+                who = "👤" if m.get("role") == "user" else "🎬"
+                st.write(f"{who} {m.get('content','')}")
+        else:
+            st.caption("L'historique apparaît ici après vos échanges.")
+
+        if st.button("🧹 Effacer l'historique", key="clear_hist_btn", use_container_width=True):
+            st.session_state.chat_history = []
+            st.session_state.last_audio_b64 = None
+            save_chat_history()
+            try:
+                st.toast("Historique effacé.")
+            except Exception:
+                st.success("Historique effacé.")
+
+
+# =============== PAGE : ACCUEIL ===============
+if page == "🏠 Accueil":
+    # Alerte reco si modèles absents
+    if st.session_state.get("_reco_global_warn"):
+        st.info(st.session_state["_reco_global_warn"])
+
+    # Titre + Hero
     st.markdown('<div class="main-title">🎥 Bienvenue sur FilmScope IA</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtitle">Sélectionnez vos genres et laissez la magie opérer.</div>', unsafe_allow_html=True)
-
-    # ====== HERO EN BAS ======
-    st.markdown(f"""
-    <div class="hero" style="
-        position: relative; border-radius: 18px; padding: 38px 24px;
-        margin: 10px 0 18px 0; overflow: hidden;
-        border: 1px solid rgba(230,196,110,0.25);
-    ">
-      <div style="
-          background: url('images/persone.jpg') center/cover no-repeat;
-          filter: blur(6px);
-          position: absolute; top:0; left:0; right:0; bottom:0; z-index:0;
-      "></div>
-      <div style="
-          background: linear-gradient(180deg, rgba(230,196,110,0.45), rgba(0,0,0,0.88));
-          position: absolute; top:0; left:0; right:0; bottom:0; z-index:1;
-      "></div>
-      <div style="position: relative; z-index: 2;">
-        <h1 style="color:#E6C46E; margin:0;">FilmScope IA</h1>
-        <p style="color: rgba(246,242,233,0.95); margin:6px 0 0 0; font-size:16.5px;">
-          <b>Explorez, analysez, prédisez</b> — Parlez d'un <b>genre</b>,
-          et on vous sert le film parfait. <i>Moins de scroll, plus d’émotions.</i>
-        </p>
-      </div>
+    st.markdown("""
+    <div class="hero">
+      <h1>FilmScope IA</h1>
+      <p><b>Explorez, analysez, prédisez</b> — Parlez d'un <b>genre</b>, et on vous sert le film parfait.
+      <i>Moins de scroll, plus d’émotions.</i></p>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("### 🎯 C’est quoi **FilmScope** ?")
     st.markdown("""
-        FilmScope IA est une application innovante qui combine l’intelligence artificielle 
-        et l’analyse cinématographique pour recommander des films parfaitement adaptés à vos envies. 
-        Elle aide les passionnés et curieux à découvrir, explorer et apprécier le cinéma grâce à des suggestions personnalisées, 
-        des résumés clairs et des visuels immersifs
+    FilmScope IA combine IA et analyse cinématographique pour recommander des films adaptés à vos envies.
     """)
 
     st.markdown("### 💡 Pourquoi **FilmScope IA** ?")
-    st.markdown(""" **Parce-que** elle fournit  :
-    -🎯 Précision – Des recommandations taillées sur mesure selon vos goûts et humeurs.  
-    -⚡ Rapidité – Trouvez en quelques secondes le film parfait, sans scroll interminable.  
-    -🌍 Ouverture – Un catalogue qui valorise autant le cinéma africain qu’international.  
-    -🗣️ Interaction – Un chatbot expert cinéma qui répond en français.  
-    -🎬 Immersion – Résumés clairs, visuels soignés et suggestions enrichissantes. 
+    st.markdown("""
+    - 🎯 Précision — Recos taillées sur mesure.  
+    - ⚡ Rapidité — Trouvez en quelques secondes.  
+    - 🌍 Ouverture — Cinéma africain & international.  
+    - 🗣️ Interaction — Chatbot en français.  
+    - 🎬 Immersion — Résumés clairs & visuels soignés.
     """)
 
     st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
-    # ===== Choix des genres + Suggestions =====
+    # Choix des genres
     GENRES = ["Action","Drama","Comedy","Romance","Science Fiction","Thriller","Horror","Animation"]
-    picked_genres = st.multiselect(
-        "🎭 Choisissez les genres que vous voulez regarder :",
-        GENRES,
-        default=["Action","Drama"],
-        help="Vous pouvez en choisir plus de genre pour affiner la sélection."
-    )
-
-    # Styles (cartes suggestions)
-    st.markdown("""
-    <style>
-      .sugg-card{display:flex;flex-direction:column;align-items:center;gap:8px}
-      .choice-pill{
-        display:inline-flex;align-items:center;justify-content:center;
-        padding:6px 12px;margin-bottom:8px;border-radius:999px;
-        background:rgba(255,215,0,0.95);color:#000;font-weight:900;font-size:12px;line-height:1.1;
-        border:1px solid rgba(122,31,31,0.30);max-width:var(--poster-w);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-      }
-      .poster-wrap{
-        position:relative;display:inline-block;width:var(--poster-w);height:var(--poster-h);
-        border-radius:12px;overflow:hidden;border:1px solid rgba(255,215,0,0.25);background:#000;
-        transition:border-color .15s ease; box-shadow:none;
-      }
-      .poster-wrap img{ width:100%;height:100%;object-fit:cover;display:block; will-change:transform;
-        backface-visibility:hidden; transition:transform .18s ease; transform:scale(1.04); transform-origin:center center; }
-      .poster-wrap:hover img{ transform:scale(1.10); }
-      .poster-wrap:hover{ border-color:rgba(255,215,0,0.45); }
-    </style>
-    """, unsafe_allow_html=True)
-
-    def _badge_text_full(gs: list[str]) -> str:
-        return "Vous avez choisi : " + ", ".join(gs) if gs else "Vous avez choisi : Tous genres"
-
     TMDB_GENRE_IDS = {
         "Action": 28, "Drama": 18, "Comedy": 35, "Romance": 10749,
         "Science Fiction": 878, "Thriller": 53, "Horror": 27, "Animation": 16
     }
+    picked_genres = st.multiselect(
+        "🎭 Choisissez les genres que vous voulez regarder :",
+        GENRES,
+        default=["Action","Drama"],
+        help="Vous pouvez en choisir plusieurs pour affiner la sélection."
+    )
 
+    # Bouton Suggestions
     if st.button("✨ Suggestions pensées pour vous", key="btn_suggest_home"):
         items: list[tuple[str, int]] = []
 
-        # 1) Reco légère (local + popular TMDB)
+        # 1) Reco légère locale
         try:
             local_titles = recommend_by_genres(picked_genres or ["Action"], limit=8) or []
             for t in local_titles:
@@ -917,67 +603,49 @@ if page == "🏠 Accueil":
                 if mid:
                     items.append((t, mid))
         except Exception:
-            local_titles = []
+            pass
 
-        # 1bis) Renfort local texte FR/EN si dataset chargé
-        if not items and HAS_MOVIES(movies) and picked_genres:
-            try:
-                sample_df = movies.sample(min(600, len(movies))) if len(movies) > 0 else movies
-                for _, row in sample_df.iterrows():
-                    try:
-                        mid = int(row["movie_id"])
-                    except Exception:
-                        continue
-                    _, g, _data = fetch_overview_vote_genres_fast(mid)
-                    if any(_norm_txt(gg) in _norm_txt(g) for gg in picked_genres):
-                        items.append((row.get("title","Titre indisponible"), mid))
-                        if len(items) >= 8:
-                            break
-            except Exception:
-                pass
-
-        # 2) Fallback TMDB si toujours rien
-        if not items:
+        # 2) Renfort TMDB si nécessaire
+        if len(items) < 8:
             genre_ids = [TMDB_GENRE_IDS[g] for g in picked_genres if g in TMDB_GENRE_IDS]
-            try:
-                tmdb_res = tmdb_by_genre(genre_ids, limit=8) if genre_ids else tmdb_popular(limit=8)
-            except Exception:
-                tmdb_res = []
+            tmdb_res = tmdb_by_genre(genre_ids, limit=8 - len(items)) if genre_ids else tmdb_popular(limit=8 - len(items))
             for m in tmdb_res:
                 title = m.get("title") or m.get("name") or "Titre indisponible"
                 mid = m.get("id")
                 if mid:
                     items.append((title, mid))
+                if len(items) >= 8:
+                    break
 
-        # Affichage
         if not items:
-            st.warning("Aucune suggestion trouvée. Essayez d’autres genres.")
+            if not _tmdb_key():
+                st.warning("Aucune suggestion (clé TMDB absente). Ajoute TMDB_API_KEY dans tes secrets.")
+            else:
+                st.warning("Aucune suggestion trouvée. Essayez d’autres genres.")
         else:
             st.caption("🎬 Résultats pensés pour vous — *sélection courte et efficace*")
             cols = st.columns(4)
-            badge_text = _badge_text_full(picked_genres)
-
+            badge_text = "Vous avez choisi : " + (", ".join(picked_genres) if picked_genres else "Tous genres")
             for i, (t, mid) in enumerate(items):
                 poster = fetch_poster(mid) if mid else "https://via.placeholder.com/300x450.png?text=No+Image"
                 with cols[i % 4]:
                     st.markdown(f"""
-                    <div class='card sugg-card' style="--poster-w:260px; --poster-h:390px;">
-                      <div class="choice-pill">{badge_text}</div>
-                      <div class="poster-wrap">
+                    <div class='card' style="--poster-w:260px; --poster-h:390px; text-align:center;">
+                      <div class="badge">{badge_text}</div>
+                      <div class="poster-wrap" style="margin:8px auto;">
                         <img src="{poster}" alt="{t}">
                       </div>
-                      <div style="text-align:center;font-weight:800;max-width:var(--poster-w)">{t}</div>
+                      <div class="card-title">{t}</div>
                     </div>
                     """, unsafe_allow_html=True)
 
     st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
-    # ===== Bande-annonce =====
+    # Bande-annonce
     st.markdown("#### 🎬 Une bande-annonce tout de suite ?")
     st.caption("Choisissez un titre, on ouvre la meilleure bande-annonce dispo.")
-
-    if HAS_MOVIES(movies):
-        film_choice = st.selectbox("Choisissez un film :", movies['title'].values)
+    if HAS_MOVIES(movies) and "title" in movies.columns:
+        film_choice = st.selectbox("Choisissez un film :", movies["title"].astype(str).values)
         if st.button("▶️ Lancer la bande-annonce", key="btn_launch_trailer"):
             mid = get_movie_id(film_choice)
             if mid:
@@ -989,27 +657,22 @@ if page == "🏠 Accueil":
                 else:
                     st.warning("Aucune bande-annonce officielle trouvée.")
             else:
-                st.info("Impossible de retrouver l’ID de ce film (vérifiez la clé TMDB).")
+                st.warning("Introuvable sur TMDB. Essayez un autre titre.")
     else:
-        st.info("Aucune donnée de films disponible pour le moment (ni pickles, ni CSV).")
-
-    # Astuce si rien ne s’affiche : rappeler la clé TMDB
-    if not _tmdb_key():
-        st.info("ℹ️ Ajoutez TMDB_API_KEY dans st.secrets ou en variable d’environnement pour des affichages enrichis (posters, trailers).")
+        st.info("Aucune donnée de films disponible (pickles/CSV manquants).")
 
     st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
-    # ===== À propos =====
+    # À propos
     st.markdown("### ✨ À propos")
     st.caption("« FilmScope IA — le cinéma, version assistée »")
     st.markdown("""
     **👩‍💻 Développée par :** MOHAMED KHADIJA  
-    **📅 Date :** 30/08/2025 • **☎️ Contact :** +237 691203120  
+    **📅 Date :** 30/08/2025 • **☎️ Contact :** +237 691203120
     """)
 
-    # Barrière anti-superposition (si ta structure l’exige)
+    # Barrière anti-superposition de sections
     st.stop()
-
 
 
 # ---- PARTIE 2 ----------
