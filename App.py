@@ -604,23 +604,229 @@ def HAS_MOVIES(df) -> bool:
 
 
 
+# ========= Imports & Helpers globaux (robustes Cloud/Local) =========
+from __future__ import annotations
+import os, ast, requests
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import streamlit as st
 
-#--------- PARTIE 1---------
+# streamlit-player est facultatif (ne doit pas crasher si absent)
+try:
+    from streamlit_player import st_player
+except Exception:
+    st_player = None
+
+# ---------- TMDB helpers ----------
+def _tmdb_key() -> str:
+    try:
+        k = st.secrets.get("TMDB_API_KEY")
+    except Exception:
+        k = None
+    return k or os.getenv("TMDB_API_KEY") or ""
+
+_TMDB_IMG = "https://image.tmdb.org/t/p/"
+
+def tmdb_get(path: str, params: dict | None = None) -> dict:
+    key = _tmdb_key()
+    if not key:
+        return {}
+    url = f"https://api.themoviedb.org/3/{path.lstrip('/')}"
+    p = dict(params or {})
+    p["api_key"] = key  # API v3
+    try:
+        r = requests.get(url, params=p, timeout=12)
+        r.raise_for_status()
+        return r.json() or {}
+    except Exception:
+        return {}
+
+def tmdb_search_title(title: str, lang: str = "fr-FR") -> dict | None:
+    if not title:
+        return None
+    d = tmdb_get("search/movie", {"query": title, "language": lang})
+    res = (d.get("results") or [])
+    return res[0] if res else None
+
+def fetch_overview_vote_genres_fast(mid: int, lang: str = "fr-FR"):
+    d = tmdb_get(f"movie/{mid}", {"language": lang}) or {}
+    ov = d.get("overview") or ""
+    genres = ", ".join([g.get("name","") for g in (d.get("genres") or []) if g.get("name")])
+    return ov, genres, d
+
+def fetch_poster(mid: int, size: str = "w500", lang: str = "fr-FR") -> str:
+    d = tmdb_get(f"movie/{mid}", {"language": lang}) or {}
+    pp = d.get("poster_path")
+    return f"{_TMDB_IMG}{size}{pp}" if pp else "https://via.placeholder.com/300x450.png?text=No+Image"
+
+def get_trailer_url(mid: int) -> str | None:
+    for lang in ("fr-FR", "en-US"):
+        d = tmdb_get(f"movie/{mid}/videos", {"language": lang}) or {}
+        vids = d.get("results") or []
+        for v in vids:
+            if v.get("site") == "YouTube" and v.get("type") == "Trailer" and v.get("key"):
+                return f"https://www.youtube.com/watch?v={v['key']}"
+    return None
+
+def tmdb_by_genre(genre_ids: list[int], limit: int = 8, lang: str = "fr-FR") -> list[dict]:
+    if not genre_ids:
+        return []
+    d = tmdb_get("discover/movie", {
+        "with_genres": ",".join(map(str, genre_ids)),
+        "sort_by": "popularity.desc",
+        "language": lang, "page": 1
+    })
+    return (d.get("results") or [])[:limit]
+
+def tmdb_popular(limit: int = 8, lang: str = "fr-FR") -> list[dict]:
+    d = tmdb_get("movie/popular", {"language": lang, "page": 1})
+    return (d.get("results") or [])[:limit]
+
+# ---------- Chargement résilient des données (pickles -> CSV fallback) ----------
+@st.cache_resource
+def _load_all():
+    base = Path(__file__).resolve().parent
+
+    def _pick(*cands):
+        for rp in cands:
+            p = (base / rp).resolve()
+            if p.exists():
+                return p
+        return None
+
+    def _load_pickle(*cands):
+        p = _pick(*cands)
+        if not p:
+            return None
+        try:
+            import pickle
+            with open(p, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+
+    def _load_numpy(*cands):
+        p = _pick(*cands)
+        if not p:
+            return None
+        try:
+            return np.load(p, allow_pickle=True)
+        except Exception:
+            return None
+
+    # Pickles pré-calculés (Git LFS)
+    movies        = _load_pickle("models/movie_list.pkl", "movie_list.pkl")
+    similarity    = _load_pickle("models/similarity.pkl", "similarity.pkl")
+    svd_model     = _load_pickle("models/svd_model.pkl", "svd_model.pkl")
+    svd_items     = _load_pickle("models/svd_items.pkl", "svd_items.pkl") or []
+    als_item_f    = _load_numpy("models/als_item_factors.npy", "als_item_factors.npy")
+    als_user_f    = _load_numpy("models/als_user_factors.npy", "als_user_factors.npy")
+    als_items_map = _load_pickle("models/als_items.pkl", "als_items.pkl") or {}
+
+    # Fallback CSV si pas de pickles
+    if movies is None or getattr(movies, "empty", True):
+        csv_path = _pick("data/tmdb_5000_movies.csv")
+        if csv_path and csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                def _genres_to_text(g):
+                    try:
+                        arr = ast.literal_eval(str(g))
+                        return ", ".join(sorted({d.get("name","") for d in arr if isinstance(d, dict) and d.get("name")}))
+                    except Exception:
+                        return ""
+                movies = pd.DataFrame({
+                    "movie_id": df["id"],
+                    "title":    df["title"].fillna("Titre indisponible"),
+                    "genres":   df["genres"].apply(_genres_to_text)
+                })
+            except Exception:
+                movies = pd.DataFrame(columns=["movie_id","title","genres"])
+        else:
+            movies = pd.DataFrame(columns=["movie_id","title","genres"])
+
+    # Message global si la reco avancée n’est pas prête (pickles manquants)
+    if similarity is None:
+        st.session_state["_reco_global_warn"] = "⚠️ Données de reco indisponibles (movie_list.pkl/similarity.pkl manquants). Fonctions limitées."
+    else:
+        st.session_state["_reco_global_warn"] = ""
+
+    return movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map
+
+movies, similarity, svd_model, svd_items, als_item_f, als_user_f, als_items_map = _load_all()
+
+def HAS_MOVIES(df) -> bool:
+    return df is not None and not getattr(df, "empty", True)
+
+# ---------- Utilitaires Accueil ----------
+def _norm_txt(s: str) -> str:
+    import unicodedata, re
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("ascii")
+    s = re.sub(r"[-–—]", " ", s)
+    return s.lower().strip()
+
+def get_movie_id(title: str) -> int | None:
+    """Retrouve l’id pour un titre via le CSV local, sinon via TMDB search."""
+    if not title:
+        return None
+    # Local
+    if HAS_MOVIES(movies) and "title" in movies.columns and "movie_id" in movies.columns:
+        try:
+            row = movies.loc[movies["title"].astype(str).str.lower() == title.lower()].head(1)
+            if not row.empty:
+                return int(row.iloc[0]["movie_id"])
+        except Exception:
+            pass
+    # TMDB
+    hit = tmdb_search_title(title)
+    if hit and hit.get("id"):
+        return int(hit["id"])
+    return None
+
+def recommend_by_genres(genres: list[str], limit: int = 8) -> list[str]:
+    """Reco légère: filtre le CSV par genres puis complète avec TMDB popular."""
+    want = [_norm_txt(g) for g in (genres or [])]
+    out: list[str] = []
+
+    if HAS_MOVIES(movies) and want:
+        try:
+            for _, r in movies.iterrows():
+                g = _norm_txt(r.get("genres",""))
+                if any(w in g for w in want):
+                    t = r.get("title","Titre indisponible")
+                    if t and t not in out:
+                        out.append(t)
+                    if len(out) >= limit:
+                        break
+        except Exception:
+            pass
+
+    if len(out) < limit:
+        for m in tmdb_popular(limit=limit - len(out)):
+            t = m.get("title") or m.get("name") or "Titre indisponible"
+            if t not in out:
+                out.append(t)
+            if len(out) >= limit:
+                break
+    return out
+
 
 # ================== PAGES ==================
 if page == "🏠 Accueil":
+    # Alerte globale (pickles manquants / mode limité)
+    if st.session_state.get("_reco_global_warn"):
+        st.warning(st.session_state["_reco_global_warn"])
+
     # ====== TITRE EN HAUT ======
     st.markdown('<div class="main-title">🎥 Bienvenue sur FilmScope IA</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtitle">Sélectionnez vos genres et laissez la magie opérer.</div>', unsafe_allow_html=True)
-    
-    # ====== HERO EN BAS (déplacé ici) ======
+
+    # ====== HERO EN BAS ======
     st.markdown(f"""
     <div class="hero" style="
-        position: relative;
-        border-radius: 18px;
-        padding: 38px 24px;
-        margin: 10px 0 18px 0;
-        overflow: hidden;
+        position: relative; border-radius: 18px; padding: 38px 24px;
+        margin: 10px 0 18px 0; overflow: hidden;
         border: 1px solid rgba(230,196,110,0.25);
     ">
       <div style="
@@ -652,10 +858,10 @@ if page == "🏠 Accueil":
 
     st.markdown("### 💡 Pourquoi **FilmScope IA** ?")
     st.markdown(""" **Parce-que** elle fournit  :
-    -🎯 Précision – Des recommandations taillées sur mesure selon vos goûts et humeurs.
-    -⚡ Rapidité – Trouvez en quelques secondes le film parfait, sans scroll interminable.
-    -🌍 Ouverture – Un catalogue qui valorise autant le cinéma africain qu’international.
-    -🗣️ Interaction – Un chatbot expert cinéma qui répond en français .
+    -🎯 Précision – Des recommandations taillées sur mesure selon vos goûts et humeurs.  
+    -⚡ Rapidité – Trouvez en quelques secondes le film parfait, sans scroll interminable.  
+    -🌍 Ouverture – Un catalogue qui valorise autant le cinéma africain qu’international.  
+    -🗣️ Interaction – Un chatbot expert cinéma qui répond en français.  
     -🎬 Immersion – Résumés clairs, visuels soignés et suggestions enrichissantes. 
     """)
 
@@ -670,48 +876,31 @@ if page == "🏠 Accueil":
         help="Vous pouvez en choisir plus de genre pour affiner la sélection."
     )
 
-    # Styles locaux : badge au-dessus + image légèrement plus grande + hover centré, sans ombre
+    # Styles (cartes suggestions)
     st.markdown("""
     <style>
-    .sugg-card{display:flex;flex-direction:column;align-items:center;gap:8px}
-    .choice-pill{
-      display:inline-flex;align-items:center;justify-content:center;
-      padding:6px 12px;margin-bottom:8px;
-      border-radius:999px;background:rgba(255,215,0,0.95);color:#000;
-      font-weight:900;font-size:12px;line-height:1.1;border:1px solid rgba(122,31,31,0.30);
-      max-width:var(--poster-w);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-    }
-    .poster-wrap{
-      position:relative;display:inline-block;
-      width:var(--poster-w);height:var(--poster-h);
-      border-radius:12px;overflow:hidden;
-      border:1px solid rgba(255,215,0,0.25);background:#000;
-      transition:border-color .15s ease;
-      box-shadow:none;
-    }
-    .poster-wrap img{
-      width:100%;height:100%;object-fit:cover;display:block;
-      will-change:transform;backface-visibility:hidden;
-      transition:transform .18s ease;
-      transform:scale(1.04);
-      transform-origin:center center;
-    }
-    .poster-wrap:hover img{ transform:scale(1.10); }
-    .poster-wrap:hover{ border-color:rgba(255,215,0,0.45); }
+      .sugg-card{display:flex;flex-direction:column;align-items:center;gap:8px}
+      .choice-pill{
+        display:inline-flex;align-items:center;justify-content:center;
+        padding:6px 12px;margin-bottom:8px;border-radius:999px;
+        background:rgba(255,215,0,0.95);color:#000;font-weight:900;font-size:12px;line-height:1.1;
+        border:1px solid rgba(122,31,31,0.30);max-width:var(--poster-w);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+      }
+      .poster-wrap{
+        position:relative;display:inline-block;width:var(--poster-w);height:var(--poster-h);
+        border-radius:12px;overflow:hidden;border:1px solid rgba(255,215,0,0.25);background:#000;
+        transition:border-color .15s ease; box-shadow:none;
+      }
+      .poster-wrap img{ width:100%;height:100%;object-fit:cover;display:block; will-change:transform;
+        backface-visibility:hidden; transition:transform .18s ease; transform:scale(1.04); transform-origin:center center; }
+      .poster-wrap:hover img{ transform:scale(1.10); }
+      .poster-wrap:hover{ border-color:rgba(255,215,0,0.45); }
     </style>
     """, unsafe_allow_html=True)
 
     def _badge_text_full(gs: list[str]) -> str:
         return "Vous avez choisi : " + ", ".join(gs) if gs else "Vous avez choisi : Tous genres"
 
-    # 🔧 Normalisation FR/EN pour le matching local
-    import unicodedata, re
-    def _norm_txt(s: str) -> str:
-        s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("ascii")
-        s = re.sub(r"[-–—]", " ", s)
-        return s.lower().strip()
-
-    # Mapping TMDB pour fallback robuste
     TMDB_GENRE_IDS = {
         "Action": 28, "Drama": 18, "Comedy": 35, "Romance": 10749,
         "Science Fiction": 878, "Thriller": 53, "Horror": 27, "Animation": 16
@@ -720,7 +909,7 @@ if page == "🏠 Accueil":
     if st.button("✨ Suggestions pensées pour vous", key="btn_suggest_home"):
         items: list[tuple[str, int]] = []
 
-        # 1) Moteur local standard
+        # 1) Reco légère (local + popular TMDB)
         try:
             local_titles = recommend_by_genres(picked_genres or ["Action"], limit=8) or []
             for t in local_titles:
@@ -730,17 +919,18 @@ if page == "🏠 Accueil":
         except Exception:
             local_titles = []
 
-        # 1bis) Renfort local FR/EN si rien trouvé
-        if not items and not movies.empty and picked_genres:
+        # 1bis) Renfort local texte FR/EN si dataset chargé
+        if not items and HAS_MOVIES(movies) and picked_genres:
             try:
-                for _, row in movies.sample(min(600, len(movies))).iterrows():
+                sample_df = movies.sample(min(600, len(movies))) if len(movies) > 0 else movies
+                for _, row in sample_df.iterrows():
                     try:
                         mid = int(row["movie_id"])
                     except Exception:
                         continue
                     _, g, _data = fetch_overview_vote_genres_fast(mid)
                     if any(_norm_txt(gg) in _norm_txt(g) for gg in picked_genres):
-                        items.append((row["title"], mid))
+                        items.append((row.get("title","Titre indisponible"), mid))
                         if len(items) >= 8:
                             break
             except Exception:
@@ -759,6 +949,7 @@ if page == "🏠 Accueil":
                 if mid:
                     items.append((title, mid))
 
+        # Affichage
         if not items:
             st.warning("Aucune suggestion trouvée. Essayez d’autres genres.")
         else:
@@ -784,7 +975,8 @@ if page == "🏠 Accueil":
     # ===== Bande-annonce =====
     st.markdown("#### 🎬 Une bande-annonce tout de suite ?")
     st.caption("Choisissez un titre, on ouvre la meilleure bande-annonce dispo.")
-    if not movies.empty:
+
+    if HAS_MOVIES(movies):
         film_choice = st.selectbox("Choisissez un film :", movies['title'].values)
         if st.button("▶️ Lancer la bande-annonce", key="btn_launch_trailer"):
             mid = get_movie_id(film_choice)
@@ -796,8 +988,14 @@ if page == "🏠 Accueil":
                     st.markdown(f"[Ouvrir la bande-annonce sur YouTube]({url})")
                 else:
                     st.warning("Aucune bande-annonce officielle trouvée.")
+            else:
+                st.info("Impossible de retrouver l’ID de ce film (vérifiez la clé TMDB).")
     else:
-        st.info("Aucune donnée de films disponible pour le moment.")
+        st.info("Aucune donnée de films disponible pour le moment (ni pickles, ni CSV).")
+
+    # Astuce si rien ne s’affiche : rappeler la clé TMDB
+    if not _tmdb_key():
+        st.info("ℹ️ Ajoutez TMDB_API_KEY dans st.secrets ou en variable d’environnement pour des affichages enrichis (posters, trailers).")
 
     st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
@@ -809,7 +1007,7 @@ if page == "🏠 Accueil":
     **📅 Date :** 30/08/2025 • **☎️ Contact :** +237 691203120  
     """)
 
-    # Barrière anti-superposition
+    # Barrière anti-superposition (si ta structure l’exige)
     st.stop()
 
 
