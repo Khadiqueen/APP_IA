@@ -1,11 +1,13 @@
 streamlit
 numpy
 pandas
+scipy
+scikit-learn
 requests
 pillow
+gTTS
+Markdown
 python-dotenv
 streamlit-player
 plotly
 groq
-gTTS
-
